@@ -1,0 +1,46 @@
+{:paths ["src"]
+
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        ;; Yggdrasil core - for SnapshotRef and HLC types
+        org.replikativ/yggdrasil {:mvn/version "0.1.7"}
+
+        ;; Cryptographic primitives for signatures
+        buddy/buddy-core {:mvn/version "1.12.0-430"}
+        buddy/buddy-sign {:mvn/version "3.6.1-359"}
+
+        ;; Content-addressed UUIDs
+        org.replikativ/hasch {:mvn/version "0.3.96"}
+
+        ;; Async operations
+        org.replikativ/superv.async {:mvn/version "0.3.50"}
+
+        ;; Storage for consensus log
+        org.replikativ/konserve {:mvn/version "0.9.345"}
+
+        ;; P2P networking
+        org.replikativ/kabel {:mvn/version "0.3.93"}
+
+        ;; HTTP server for Kabel WebSocket
+        http-kit/http-kit {:mvn/version "2.8.0"}}
+
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1"
+                       :git/sha "dfb30dd"}
+                      org.clojure/test.check {:mvn/version "1.1.1"}}
+         :main-opts ["-m" "cognitect.test-runner"]
+         :exec-fn cognitect.test-runner.api/test}
+
+  :dev {:extra-paths ["dev"]
+        :extra-deps {nrepl/nrepl {:mvn/version "1.1.0"}}}
+
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
+                 slipset/deps-deploy {:mvn/version "0.2.0"}}
+          :ns-default build}
+
+  :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+           :main-opts ["-m" "cljfmt.main" "check"]}
+
+  :ffix {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+         :main-opts ["-m" "cljfmt.main" "fix"]}}}
