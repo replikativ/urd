@@ -19,6 +19,8 @@
   Numbers below were taken from the JVM and verified against Node."
   (:require [clojure.test :refer [deftest is testing]]
             [urd.consensus.algorithms.raft :as raft]
+            [urd.consensus.algorithms.nakamoto :as nk]
+            [urd.consensus.bignat :as bn]
             [urd.consensus.proposer :as proposer]
             [urd.consensus.signing :as signing]
             [urd.consensus.rng :as rng]))
@@ -103,3 +105,64 @@
                 {:height 3 :round 3 :step :propose}
                 {:height 4 :round 0 :step :propose}
                 {:height 2 :round 9 :step :precommit}]))))
+
+;; ============================================================
+;; Nakamoto: 256-bit arithmetic and proof of work
+;;
+;; This is the part of the codebase with the most room to diverge and the least
+;; chance of the divergence being visible. Cumulative work is a 256-bit
+;; quantity; a JavaScript double holds 53 bits exactly. Had `bignat` been a
+;; reader conditional over BigInteger and js/BigInt, every value below would
+;; have been computed by two different implementations, and a fork-choice
+;; comparison that disagreed by one unit would move the chain tip in a browser
+;; and not on the JVM. It is one implementation, and these values pin it.
+;; ============================================================
+
+(def mainnet-genesis
+  {:version 1
+   :prev nk/zero-hash
+   :merkle-root "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+   :time 1231006505
+   :bits 0x1d00ffff
+   :nonce 2083236893})
+
+(deftest big-arithmetic-agrees-across-platforms
+  (testing "multiplication and division of 256-bit naturals"
+    (is (= "000010c6f45449cb59c68de5940cbb3a00c64fb40c5045ab2cf943affe7d139d"
+           (bn/to-hex (bn/div (bn/pow2 256) (bn/from-int 1000003)) 32))
+        "a full-width division -- the loop `calc-work` runs")
+    (is (= "00000000ddb06310dc4b61d816347d5111d40e6023f7473f82b28e242d2075a5"
+           (bn/to-hex (bn/mul (bn/from-hex "deadbeefcafe0123456789abcdef")
+                              (bn/from-hex "fedcba98765432100123456789ab"))
+                      32))
+        "a schoolbook multiply, whose accumulator is the widest intermediate
+         anywhere in the library")
+    (is (= 257 (bn/bit-length (bn/pow2 256))))))
+
+(deftest proof-of-work-agrees-across-platforms
+  (testing "the header encoding and double-SHA256, against Bitcoin's own genesis
+
+           This is the most load-bearing value in the algorithm. If the byte
+           order, the little-endian fields, or the digest differ between
+           platforms, a browser node and a JVM node disagree about which blocks
+           exist at all."
+    (is (= "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+           (nk/header-id mainnet-genesis)))
+    (is (nk/pow-valid? mainnet-genesis))
+    (is (= 4295032833 (bn/to-int (nk/calc-work 0x1d00ffff)))
+        "difficulty 1 is exactly 2^32 expected hashes")
+    (is (= "00000000000000000000000000000000000000000000000000003fb3ab764c00"
+           (bn/to-hex (nk/calc-work 0x1b0404cb) 32)))))
+
+(deftest compact-codec-agrees-across-platforms
+  (testing "the codec is bit manipulation on values above 2^31, which is exactly
+           where ClojureScript's signed 32-bit bit operations bite"
+    (is (= 0x0200ff00 (nk/target->compact (bn/from-int 255)))
+        "the sign-bit renormalisation")
+    (is (= 0x03010000 (nk/target->compact (nk/compact->target 0x05000001))))
+    (is (= 31 (nk/compact-exponent 0x1f123456))
+        "extracting the exponent of a compact value above 2^31")
+    (is (nk/compact-negative? 0xff800000))
+    (is (= 0x1b010132 (nk/retarget (nk/params {:pow-limit-bits 0x1d00ffff})
+                                   0x1b0404cb 1000000 1000001))
+        "a retarget clamped at the 1/4 bound")))
