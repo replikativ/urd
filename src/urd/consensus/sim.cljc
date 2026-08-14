@@ -209,10 +209,31 @@
       (update-in sim [:committed peer-id] into (:vertices params))
 
       :revert
-      (-> sim
-          (update-in [:reverted peer-id] (fnil conj []) (:to-vertex params))
-          (update :trace conj {:tick (:tick sim) :event :revert
-                               :peer peer-id :to (:to-vertex params)}))
+      ;; The committed prefix is TRUNCATED to end at `to-vertex`, not merely
+      ;; noted. Until Nakamoto landed, no algorithm emitted a `:revert` at all,
+      ;; and this branch only recorded one -- which meant `agreement?` could not
+      ;; possibly have detected a reorg-induced divergence, because the two
+      ;; nodes' committed vectors kept the abandoned branch and stayed unequal
+      ;; forever regardless of whether they had actually converged.
+      ;;
+      ;; The truncation has to be done by SEARCH, because `[:revert
+      ;; {:to-vertex v}]` says where the prefix should now end but not what to
+      ;; drop, and an interpreter holds only a flat sequence of committed
+      ;; vertices with no parent links to walk. A `to-vertex` that was never
+      ;; committed -- the genesis block, say -- is therefore indistinguishable
+      ;; from an unknown one, and both mean "revert everything". See the PR's
+      ;; friction notes; this is an API gap, not an implementation choice.
+      (let [to (:to-vertex params)
+            committed (vec (get-in sim [:committed peer-id] []))
+            at (last (keep-indexed (fn [i v] (when (= v to) i)) committed))
+            keep-n (if at (inc at) 0)
+            dropped (subvec committed keep-n)]
+        (-> sim
+            (assoc-in [:committed peer-id] (subvec committed 0 keep-n))
+            (update-in [:reverted peer-id] (fnil conj []) (:to-vertex params))
+            (update :trace conj {:tick (:tick sim) :event :revert
+                                 :peer peer-id :to (:to-vertex params)
+                                 :dropped dropped})))
 
       :report-equivocation
       (update sim :equivocations conj
