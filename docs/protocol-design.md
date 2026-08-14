@@ -641,3 +641,208 @@ Every one of these was green for the wrong reason:
 
 **A guard is only a guard once you have watched it fail.** Before trusting a check,
 make it fail on purpose.
+
+---
+
+## 16. Revisions after Bullshark (2026-08-14)
+
+Six algorithms now run on the protocol. Bullshark was chosen because it is the only
+one whose **ordering layer sends zero messages** and the only one that **commits a
+multi-vertex sequence retroactively** — two protocol features nothing had exercised.
+Both worked. What did not is more useful.
+
+### The claims under test
+
+**1. `step` returning no outbound effect while still committing — CONFIRMED, and
+it is the common case.** In a four-node run, 12 of 16 commits carried no `:send`
+or `:broadcast` at all; the remainder were incidental, from a certificate
+broadcast that happened to land in the same step. The simulator handled it with
+no special case, because nothing in it ever assumed a decision is accompanied by
+a message. §2's note on this was speculative when written; it is now evidence.
+
+The stronger statement is that the ordering layer produces no effects *at all*:
+`bullshark/commit-sequence` is a pure `(state, round) -> [state, sequence]` with
+no effect vector anywhere in it, and the `:commit` is manufactured by its caller.
+An algorithm whose decision procedure is a function of local state and nothing
+else fits the protocol exactly.
+
+**2. Multi-vertex `:commit` — CONFIRMED, up to 77 vertices and 10 anchors in one
+effect.** A node holding a 21-round DAG that has not yet run the ordering layer
+emits a single `:commit` of the whole thing, and the sequence is identical,
+vertex for vertex, to the one a node that ordered every round as it arrived
+produced. That equality *is* Bullshark's central claim, and `:commit`'s vector
+shape expressed it with nothing to spare and nothing missing.
+
+`:index` as POSITION (the correction Nakamoto forced) was usable directly:
+folding the commits back together by index reproduces the committed sequence
+exactly. Bullshark never reverts, so position and running count coincide here —
+it neither confirms nor challenges the distinction.
+
+**3. State that is a GRAPH — CONFIRMED, and it needed nothing.** `ConsensusState`
+is `{last-committed-round, last-committed {author -> round}, dag {round {author
+-> cert}}}`. The protocol is agnostic about the shape of a node's state, so there
+was nothing to fight. Recovery is where it got interesting; see below.
+
+**4. Leader selection as a config-supplied pure function of (round, committee) —
+FITS, but the protocol offers nothing for it.** `:anchor-fn` is passed in the node
+config and never mentioned by `node.cljc`. That is fine, and worth noticing: four
+of six algorithms now do leader or proposer selection and each invented its own
+seam — Raft's randomized timeouts, Tendermint's `proposer.cljc`, round-robin's
+index, Bullshark's `:anchor-fn`. There may be an abstraction here; there is
+certainly a repetition.
+
+### `node/threshold-membership` had a silent safety hole, and its test asserted it
+
+`ThresholdMembership` summed per-validator **stake** on one side of the comparison
+and applied `threshold-fn` to the **head count** on the other. With four
+validators of power ten each, a single statement cleared `byzantine-threshold(4)
+= 3` and was reported as a Byzantine quorum. The correct threshold is
+`byzantine-threshold(40) = 27`.
+
+This is §15's rule in its purest form yet. The behaviour was:
+
+- documented correctly (*"a quorum is measured by summed weight rather than head
+  count"*);
+- implemented incorrectly;
+- pinned by `quorum-respects-voting-power`, whose own comment — *":a alone holds
+  3 of 6 power, meeting the threshold of 3"* — states the bug out loud without
+  noticing, because 3 is the threshold for the wrong quantity;
+- and invisible, because every algorithm using `Membership` runs uniform weights,
+  and the one algorithm with genuinely non-uniform thresholds (Tendermint) had
+  already worked around it by writing its own record.
+
+Fixed: both sides are weight when `:voting-power` is present and head count when
+it is not, leaving the uniform case bit-identical. The test now asserts the safe
+answer, plus a uniform-equals-unweighted check.
+
+**Bullshark still does not use `Membership`.** Its thresholds are `2*total/3 + 1`
+and `(total+2)/3` over stake, applied to sets of certificate *signers* and to
+sets of *certificates*, not to "statements with a sender"; `pred` over statements
+describes neither. That makes it **one protocol, two instantiations, and four
+algorithms that do not want it** — Snowman, Nakamoto, Raft's commit index, and
+now Bullshark.
+
+### Timer ids had an undocumented type constraint that crashed the simulator
+
+`fire-due-timers` did `(sort-by key timers)` for reproducibility. `compare` throws
+on two values of different types, so a node that armed `:gossip` and `[:anchor 3]`
+died with a `ClassCastException` raised inside the simulator's scheduling loop,
+naming neither the node nor the timer. Nothing in `set-timer`'s contract said
+timer ids had to be mutually comparable, and "one timer per round" is the first
+thing a round-based algorithm reaches for.
+
+Fixed by sorting on the printed id — a total order over any ids at all, and the
+same order as before for the keyword ids every existing algorithm uses.
+
+### What the barrier does not say
+
+§3's rule — *gate exactly the messages that constitute this node's binding
+commitment* — says what to **gate** and is silent on what to **store**, and the
+two are not the same. Bullshark persists a `(author, round) -> header-digest`
+double-sign guard, which is exactly the binding commitment. It is not enough: a
+restarted node then knows it must not sign a *different* header for that slot and
+has no way to re-send the one it *did* sign. The first version of this port did
+precisely that, and on restart it asked the application for a payload, built a
+header over a fresh parent set, got a different digest, and signed it — **an
+honest node equivocating with its own past self, across a crash**, with the guard
+it kept for that purpose sitting unconsulted, because the guard was checked for
+other authors' headers and not for its own.
+
+The fix is to persist the signed artefact next to the guard. Stated as a rule:
+*gate what you sign; store what you sign.* Worth adding to §3.
+
+### Crash recovery has no protocol seam, and Nakamoto's workaround is load-bearing twice
+
+Narwhal reconstructs from a certificate store rather than replaying events, and
+this port goes further: because ordering is pure, **nothing about the committed
+sequence is remembered**. The node reloads its certificates and re-runs
+`commit-sequence` over every round. Only three things are durable — the
+certificate archive, the double-sign guard, and this node's own proposals — and
+no event log among them.
+
+But the protocol offers no way to say *"here is my committed prefix,
+resynchronise"*. The only available expression is Nakamoto's: a `:revert` to a
+vertex that was never committed (which truncates everything) followed by a
+`:commit` of the re-derived sequence. It works, and the `:dropped` verification
+Nakamoto added keeps it honest. Two algorithms have now needed it and neither
+wanted a revert, which is the usual sign that a primitive is missing. Something
+like `[:resync {:prefix [...]}]` would say what is meant.
+
+### The certificate store is not the consensus DAG, and the protocol cannot see the difference
+
+Bullshark's GC prunes each author's certificates below its own last committed
+round, so a healthy node's DAG holds almost nothing old. Serving a lagging peer's
+catch-up request from it means the peer asks for round 10 and every node that
+could answer has already dropped round 10. This port did that, and the symptom
+was not an error: three nodes agreed perfectly and the fourth sat at round 3
+forever, which reads as a partition that did not heal.
+
+Narwhal splits the two — `ConsensusState.dag` is the lossy working set,
+`CertificateStore` is the archive, and the synchronizer answers from the store.
+That distinction lives entirely inside the algorithm; `:persist-then` writes a map
+and says nothing about what may be read back or when. This is the same gap
+Tendermint recorded as "catch-up / state sync", and it has now cost two
+algorithms.
+
+### Confirmed, with evidence
+
+- **`:report-equivocation` now has a Byzantine algorithm that is not Tendermint.**
+  An author broadcasting two headers per round produces 111 reports in 120 ticks
+  and certifies nothing at all: the honest majority splits its votes, neither
+  header reaches 2f+1, and the equivocator contributes no vertex to the DAG while
+  the other three continue. The evidence shape (both statements) was again
+  natural to produce.
+- **`request-value` fits a payload-carrying mempool** unmodified. The payload
+  here is the map of snapshot ids datahike already hands to
+  `coordinated-commit!`; Narwhal's own is the same shape,
+  `{batch-digest -> worker-id}`.
+- **Logical time is still enough.** Bullshark-PS waits for the anchor before
+  sealing a round's parent set, and a tick count expressed the timeout.
+- **`fixpoint` was not needed**, but the same idea appeared anyway: parked
+  certificates are re-inserted until none is ready.
+
+### On the yggdrasil framing
+
+The premise was that Narwhal's certified DAG is structurally close to yggdrasil's
+git-like causal DAG of content-addressed snapshots. **It is close, it is not the
+same, and the difference is not bridgeable.** Bullshark needs a *round-indexed*
+DAG with exactly one vertex per author per round and >= 2f+1 stake of parents from
+*exactly* the previous round; yggdrasil parents are arbitrary. Every shortcut in
+the ordering layer depends on the stronger shape: `linked?` walks a frontier one
+round at a time instead of doing reachability, `order-sub-dag` resolves parents
+only in `round - 1`, and the anchor is a function of a round number that has to
+exist.
+
+So the framing held in the form it was proposed: the certificate DAG is a
+**urd-owned structure whose payload is snapshot ids**. What is shared with
+yggdrasil is content-addressing — `hasch/uuid` over the header — and that is the
+load-bearing part anyway, since it is what lets two nodes name the same vertex
+without coordinating.
+
+One portability trap, invisible and fatal: the digest comparator decides the DFS
+push order, which decides the intra-round order, which decides the total order. A
+raw UUID must never be compared — the JVM's `UUID/compareTo` compares the two
+64-bit halves as **signed** longs, ClojureScript's compares the printed string,
+and those orders differ for any pair whose high bit differs, i.e. half of all
+pairs. Two nodes on the same certified DAG would commit the same vertices in
+different sequences, each convinced it was correct, with nothing lost and nothing
+to detect it on — because the ordering layer sends no messages, there is no
+disagreement to observe. Digests are strings everywhere, and `portability-test`
+pins the whole committed sequence rather than a digest, since a digest
+fingerprint alone would catch neither a comparator nor an unstable sort.
+
+### The reference implementation is wrong about its own back-fill
+
+`consensus/src/utils.rs:22-25` reads `(last_committed_round + 2 .. leader.round())
+.rev().step_by(2)`. Rust builds the descending sequence first and steps it
+afterwards, so it visits `leader.round()-1, -3, ...` — **odd** rounds, where by
+construction there is never an anchor. It has read that way since the original
+Bullshark commit, inherited from the Facebook Tusk code. The test suite cannot
+see it, because `#[cfg(test)]` swaps the leader function for one returning the
+same authority at every round, so the odd-round certificate it picks up is an
+ancestor of the even anchor anyway and its sub-DAG is a subset.
+
+We implement the published algorithm — even rounds, stepping back by 2 — and say
+so at the call site. Recorded here because it is a clean instance of §15 from
+outside this codebase: a test suite green for the wrong reason, in the reference
+everyone ports from.
