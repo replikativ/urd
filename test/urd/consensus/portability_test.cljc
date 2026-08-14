@@ -19,6 +19,8 @@
   Numbers below were taken from the JVM and verified against Node."
   (:require [clojure.test :refer [deftest is testing]]
             [urd.consensus.algorithms.raft :as raft]
+            [urd.consensus.proposer :as proposer]
+            [urd.consensus.signing :as signing]
             [urd.consensus.rng :as rng]))
 
 (defn- words [seed n]
@@ -61,3 +63,43 @@
       (is (every? #(and (>= % 10) (< % 20)) ts))
       (is (> (count (distinct ts)) 1)
           "identical timeouts would make split votes unresolvable"))))
+
+;; ============================================================
+;; Tendermint's integer arithmetic
+;;
+;; Proposer selection is the only place in the Tendermint port that does
+;; non-obvious integer maths, and it does it three ways in ten lines: a
+;; truncating divide in `rescale`, a FLOORING divide in `center`, and an
+;; arithmetic shift in `new-validator-priority`. All three round differently on
+;; negatives, and the shift is 32-bit in ClojureScript.
+;; ============================================================
+
+(deftest proposer-selection-agrees-across-platforms
+  (let [p0 (proposer/initial-priorities [:a :b :c :d])]
+    (is (= [:a :b :a :c :d :a :b :a]
+           (mapv #(proposer/proposer-for p0 {:a 4 :b 2 :c 1 :d 1} %) (range 8))))))
+
+(deftest priority-centering-floors-on-both-platforms
+  (testing "`quot` truncates toward zero and would give {:a 0 :b -1 :c 0 :d 0}
+            here; CometBFT's big.Int.Div floors, and so must we"
+    (is (= {:a 1 :b 0 :c 1 :d 1} (proposer/center {:a 0 :b -1 :c 0 :d 0})))))
+
+(deftest priority-rescaling-truncates-toward-zero-on-both-platforms
+  (testing "and this one must NOT floor: Go's int64 `/` truncates, so a
+            negative priority rounds up, not down"
+    (is (= {:a 7 :b 0 :c 0 :d 0} (proposer/rescale {:a 1000 :b 0 :c -3 :d 0} 8)))))
+
+(deftest the-new-validator-shift-agrees-across-platforms
+  (testing "ClojureScript's bit-shift-right is a 32-bit signed shift"
+    (is (= [-1 -7 -9 -18 -1125]
+           (mapv proposer/new-validator-priority [1 7 8 16 1000])))))
+
+(deftest the-double-sign-guard-agrees-across-platforms
+  (is (= [false false true true true false]
+         (mapv #(signing/may-sign? % {:height 3 :round 2 :step :prevote})
+               [{:height 3 :round 2 :step :prevote}
+                {:height 3 :round 2 :step :propose}
+                {:height 3 :round 2 :step :precommit}
+                {:height 3 :round 3 :step :propose}
+                {:height 4 :round 0 :step :propose}
+                {:height 2 :round 9 :step :precommit}]))))
