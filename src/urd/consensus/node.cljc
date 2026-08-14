@@ -377,18 +377,41 @@
                       {:state-keys (keys state)})))
     (count vs)))
 
-(defrecord ThresholdMembership [threshold-fn]
+(defn- distinct-voters
+  "The DISTINCT senders among statements satisfying `pred`.
+
+  Counting statements rather than senders is a safety hole, not a detail: three
+  copies of one validator's vote would clear a quorum of four, so a single
+  Byzantine validator could decide a height by repeating itself. Duplicate
+  suppression cannot be left to callers, because every caller would have to
+  remember, and the failure is silent.
+
+  `voter-fn` extracts the sender; statements that do not identify one are
+  rejected rather than counted, since an anonymous statement cannot be
+  attributed and therefore cannot count toward a threshold."
+  [voter-fn statements pred]
+  (into #{}
+        (comp (filter pred)
+              (map voter-fn)
+              (remove nil?))
+        statements))
+
+(defrecord ThresholdMembership [threshold-fn voter-fn]
   Membership
-  (quorum? [_ state statements pred]
+  (quorum? [this state statements pred]
     (let [n (validator-count state)
-          k (count (filter pred statements))]
-      (>= k (threshold-fn n))))
-  (v-blocking? [_ state statements pred]
+          voters (distinct-voters voter-fn statements pred)
+          w (reduce + 0 (map #(weight this state %) voters))]
+      (>= w (threshold-fn n))))
+  (v-blocking? [this state statements pred]
     ;; A set blocks if its complement can no longer reach the threshold.
     (let [n (validator-count state)
-          k (count (filter pred statements))]
-      (> k (- n (threshold-fn n)))))
-  (weight [_ _ _] 1))
+          voters (distinct-voters voter-fn statements pred)
+          w (reduce + 0 (map #(weight this state %) voters))]
+      (> w (- n (threshold-fn n)))))
+  (weight [_ state peer-id]
+    ;; Uniform unless the state supplies per-validator power.
+    (get (:voting-power state) peer-id 1)))
 
 (defn byzantine-threshold
   "floor(2n/3) + 1 -- the Byzantine quorum.
@@ -415,8 +438,17 @@
   [n]
   (quot (max 0 (dec n)) 3))
 
-(def bft-membership (->ThresholdMembership byzantine-threshold))
-(def cft-membership (->ThresholdMembership majority-threshold))
+(defn threshold-membership
+  "Membership by a numeric threshold over DISTINCT senders.
+
+  `voter-fn` extracts the sender from a statement; defaults to `:from`. Per
+  validator voting power may be supplied as `:voting-power` in the state, in
+  which case a quorum is measured by summed weight rather than head count."
+  ([threshold-fn] (threshold-membership threshold-fn :from))
+  ([threshold-fn voter-fn] (->ThresholdMembership threshold-fn voter-fn)))
+
+(def bft-membership (threshold-membership byzantine-threshold))
+(def cft-membership (threshold-membership majority-threshold))
 
 ;; ============================================================
 ;; Effect classification (used by runtimes and the simulator)
