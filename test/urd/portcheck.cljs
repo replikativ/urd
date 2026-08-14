@@ -29,10 +29,19 @@
     FINGERPRINT {:roles [:follower :follower :follower :follower :leader],
                  :terms [1 1 1 1 1],
                  :commits [53 53 53 53 54],
-                 :committed-counts [53 53 53 53 54]}"
+                 :committed-counts [53 53 53 53 54]}
+
+    NAKAMOTO {:tip \"00488c18391b0c201c7ec97ee4d99333252eb3c800b3503a3d081396c6813490\",
+              :height 6,
+              :work \"00000000000000000000000000000000000000000000000000000000000000d4\",
+              :bits [545259519 538968063 538968063 537395199 537395199 537001983],
+              :nonces [0 10 3 76 2 77]}"
   (:require [clojure.test :as t]
             [urd.consensus.portability-test]
             [urd.consensus.algorithms.raft :as raft]
+            [urd.consensus.algorithms.nakamoto :as nk]
+            [urd.consensus.bignat :as bn]
+            [urd.consensus.node :as node]
             [urd.consensus.sim :as sim]))
 
 (def peers [:n1 :n2 :n3 :n4 :n5])
@@ -53,8 +62,43 @@
      :commits (mapv #(:commit (sim/node-state s %)) peers)
      :committed-counts (mapv #(count (sim/committed s %)) peers)}))
 
+(defn nakamoto-fingerprint
+  "A short mined chain reduced to a comparable value.
+
+  Every quantity here is computed by code that a double cannot represent: the
+  block ids are double-SHA256 over an 80-byte encoding, the work is a 256-bit
+  sum, and the `bits` come out of a difficulty retarget whose arithmetic runs
+  through the compact codec. The nonces are the toy miner's, so they also pin
+  the proof-of-work COMPARISON -- a node that accepted a different first nonce
+  would have a different notion of which hashes meet a target.
+
+  Trivial difficulty on purpose: this is a portability check, not mining."
+  []
+  (let [genesis {:version 1 :prev nk/zero-hash :merkle-root nk/zero-hash
+                 :time 1600000000 :bits 0x207fffff :nonce 0}
+        p {:pow-limit-bits 0x207fffff :blocks-per-retarget 2 :target-timespan 1200}
+        st0 (:state (node/init (nk/create) {:peer-id :fp :validators [:fp]
+                                            :params p :genesis genesis
+                                            :now 2000000000}))
+        [st ids] (loop [st st0, i 0, ids []]
+                   (if (= i 6)
+                     [st ids]
+                     (let [tip (:tip st)
+                           tpl (nk/template st
+                                            {:time (inc (get-in st [:blocks tip :header :time]))
+                                             :merkle-root (str (apply str (repeat 63 "0")) i)})
+                           h (nk/mine tpl 1000000)]
+                       (recur (:state (nk/process-header st h nil))
+                              (inc i) (conj ids (nk/header-id h))))))]
+    {:tip (:tip st)
+     :height (nk/height st (:tip st))
+     :work (bn/to-hex (nk/tip-work st) 32)
+     :bits (mapv #(get-in st [:blocks % :header :bits]) ids)
+     :nonces (mapv #(get-in st [:blocks % :header :nonce]) ids)}))
+
 (defn -main [& _]
   (t/run-tests 'urd.consensus.portability-test)
-  (println "FINGERPRINT" (pr-str (fingerprint))))
+  (println "FINGERPRINT" (pr-str (fingerprint)))
+  (println "NAKAMOTO" (pr-str (nakamoto-fingerprint))))
 
 (set! *main-cli-fn* -main)
