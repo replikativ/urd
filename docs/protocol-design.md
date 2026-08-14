@@ -641,3 +641,210 @@ Every one of these was green for the wrong reason:
 
 **A guard is only a guard once you have watched it fail.** Before trusting a check,
 make it fail on purpose.
+
+---
+
+## 16. Revisions after SCP (2026-08-14)
+
+Stellar SCP is the sixth algorithm and the one two of the core abstractions were
+designed for and had never met: `Membership`'s tri-state `quorum?` and `step`'s
+internal fixpoint. Both were built speculatively in §4 and §2 and listed as
+"still unvalidated" in §12. This is the verdict.
+
+### `Membership` is the right shape for SCP — and is under-informative
+
+SCP is the case §4 was written for, and the parts that were designed for it hold:
+
+- **A predicate rather than a size is exactly right.** Federated voting calls one
+  piece of machinery with three different predicates (`voted`, `voted ∨ accepted`,
+  `accepted`), and the ballot protocol calls it with four more that are
+  parameterised by a ballot and a counter interval. A `(quorum-size n)` API cannot
+  express any of them. This is the strongest confirmation any part of §4 has had.
+- **`v-blocking?`'s signature is exactly right**, and the asymmetry §4 predicted is
+  real and load-bearing: `v-blocking?` reads only the local quorum set, so it is
+  always decidable, and it is the only reason a node with an empty quorum-set
+  cache can make progress at all.
+- **`quorum?` returning `true/false/:unknown` is right and is genuinely
+  exercised.** SCP is the first algorithm here whose safety check can be
+  undecidable pending data. It works.
+
+Three frictions, in descending order of how much they cost:
+
+1. **`:unknown` cannot say what it is waiting for**, so the algorithm has to walk
+   the same statements a second time to collect the missing quorum-set hashes
+   (`scp/missing-qset-hashes`). Every caller of a tri-state `quorum?` will need
+   that walk, and every caller will write it differently. `:unknown` should carry
+   its witness: `[:unknown #{hash ...}]`, or the protocol should gain a companion
+   `undecided-because`.
+
+2. **`statements` as a bare collection is a hazard.** Only the *latest* statement
+   per node may count, under a total order (`isNewerStatement`,
+   `BallotProtocol.cpp:54-131`) the protocol cannot know. `node/distinct-voters`
+   dedupes by sender, which stops the same statement counting twice, but does not
+   stop a *stale* statement from being counted next to a current one — and for
+   SCP that is the same safety hole in a new costume, since a Byzantine node
+   would be voting twice. The protocol should take a `{node → statement}` map, not
+   a sequence, and make "reduce to the newest" the caller's visible obligation.
+
+3. **`weight` does not fit and should be optional.** SCP's node weight is defined
+   relative to a *quorum set* (`LocalNode.cpp:100-140`), not globally, and no
+   quorum decision reads it — it is used only to bias the nomination leader
+   lottery. A three-method protocol whose third method is inapplicable to the
+   algorithm the protocol was designed for is a sign the third method belongs
+   somewhere else.
+
+Tally, updating §13's: `Membership` fits Tendermint, Raft's votes, and SCP —
+three of six — and SCP needs a richer `quorum?` than the other two.
+
+### The tri-state is real, but stellar-core does not have it where §4 says
+
+§4 cites `LocalNode.cpp:428-479` for `TB_TRUE/TB_FALSE/TB_MAYBE`. That function is
+`isNodeInQuorum` — a transitive *reachability* query used by monitoring — not the
+quorum check federated voting runs. Inside `isQuorum` itself
+(`LocalNode.cpp:266-274`) an unresolvable quorum set silently *excludes* its node,
+which is a two-valued under-approximation, and stellar-core keeps it honest by
+never letting such an envelope reach the slot at all: `Herder`'s `ItemFetcher`
+parks it until the quorum set arrives.
+
+So the three-valued answer is a real improvement rather than a transcription, and
+it is worth having for a reason §4 did not state. The useful distinction is not
+"a hash is missing" but **"would the answer change if I fetched it?"** — computed
+as two bounds, dropping the unresolvable nodes and assuming them satisfied. That
+is sound because learning a quorum set can only add survivors to the fixpoint. It
+means `:unknown` is exactly the condition under which fetching is worth doing, and
+`false` keeps its ordinary meaning. A test in `scp_test` pins the case that
+distinguishes the two definitions: an unresolvable node *outside* the local node's
+transitive trust leaves the answer decided.
+
+### `[:request-qset]` should NOT be added — an existing effect suffices
+
+§4 proposed a `[:request-qset]` effect and a `:qset-received` event. **We
+implemented quorum-set fetching and needed neither.** A missing quorum set can
+only come from a peer, so the request is a `send-to` and the reply is a
+`message-received`; the node unicasts to whichever peer's statement referenced the
+hash, because that peer certainly has it. Adding a bespoke effect would have
+hidden a network round trip — with its own loss, delay, and dishonesty — behind
+something that looks local.
+
+Two things did have to be got right, and both are algorithm-level, not
+protocol-level: the reply is content-addressed and the address is **verified**
+before the cache is touched (otherwise a Byzantine peer answers a fetch with
+`{:threshold 1 :validators [attacker]}` and manufactures a quorum out of nothing),
+and outstanding requests are re-issued on a timer.
+
+**One genuine gap it did surface: the protocol has no way to READ durable state.**
+`persist-then` writes; `init`'s `:restored` is the only read, and it happens once.
+stellar-core caches quorum sets across restarts, and there is no way to express
+that here — a restarted node must re-fetch everything over the network. A
+`[:read {:keys ...}]` effect with a matching event is the missing half of the
+storage interface.
+
+### `fixpoint` is load-bearing, and SCP wants only half of it
+
+Confirmed, and this is the algorithm that needs it: a single arriving
+EXTERNALIZE statement walks a node through accept-prepared → accept-commit →
+confirm-commit in one `step`, each unlocked only by the previous one having
+landed — including one step whose precondition is the node's *own* newly implied
+statement. One-transition-per-event cannot express it, and the ordering of the
+rules is normative rather than incidental. It terminates; the 200-iteration budget
+is never approached (`rule-passes` peaks in the low teens).
+
+But **`fixpoint`'s effect accumulation is the wrong half of the abstraction for
+SCP, and we do not use it.** A node's statement is a *function of its state*, and
+stellar-core's own `advanceSlot` ends by consolidating whatever the recursion
+produced into a single `sendLatestEnvelope`. Accumulating effects per iteration
+would broadcast every intermediate statement. So the rules here are pure
+state → state, and every effect — the broadcast, the commit, the timers, the
+fetches — is derived once from the settled state by comparing it against what was
+last sent. That is simpler *and* idempotent: running the fixpoint longer cannot
+duplicate an effect.
+
+Worth generalising. `fixpoint` should probably be two functions: a state fixpoint
+(what SCP wants) and the effect-accumulating one.
+
+### Deriving the self-statement beats feeding it back
+
+stellar-core emits its own statement into its own envelope map
+(`emitCurrentStateStatement` → `processEnvelope(env, self=true)`), which is the
+only genuinely re-entrant path in the reference implementation and the reason it
+needs a recursion guard. Computing the self-statement as a pure function of state
+instead removes the re-entrancy entirely and cannot go stale. Any port of a
+protocol whose node counts its own vote should do this.
+
+### Config: `:validators` is actively misleading, and the simulator injects it
+
+`sim/make` merges `{:peer-id p :validators peer-ids}` into every node's config
+unconditionally. For SCP a flat validator list is not merely unnecessary, it is
+**meaningless** — there is no global validator set, and any node that read it
+would be reading a fiction the simulator invented. What SCP needs per node is:
+
+```clojure
+{:peer-id :a
+ :qset {:threshold 3 :validators [:a :b :c :d] :inner-sets [...]}  ; REQUIRED
+ :qsets {...}      ; optional pre-seeded quorum-set cache
+ :value ...}       ; what this node would like to nominate
+```
+
+`init` throws when `:qset` is absent or malformed, for the same reason
+`node/validator-count` throws on a missing `:validators`: a threshold of zero
+makes the empty set a slice and therefore every set a quorum, which is a silent
+total safety failure that looks like normal operation.
+
+The broader point: **trust belongs to the node configuration, not to the
+simulator.** The simulator should supply `:peer-id` and let the configuration say
+what trust means, rather than asserting a model of trust that four of six
+algorithms do not share.
+
+### Safety is per-node, and the harness could not previously say so
+
+Every earlier algorithm has a system-wide safety property, and `sim/agreement?`
+is it. SCP does not, and asserting it would be asserting something false. SCP's
+theorem is conditioned on **quorum intersection between the nodes in question**,
+so the oracle is intersection over a *subset* (`scp/intertwined?`), and a node
+outside that subset may externalize whatever the network hands it. `scp_test`
+demonstrates it: two intertwined clusters with no node in common, plus a node
+whose single slice either cluster satisfies, which decides differently under two
+different partitions while both clusters stay internally consistent in both runs.
+`sim/agreement?` correctly reports the system as divided — which is also the
+occasion on which the safety monitor was watched failing, per §15.
+
+### Two implementation findings worth carrying
+
+- **A portable hash is not automatically a good hash.** The nomination leader
+  lottery is a comparison between hashes of strings that differ in one character.
+  With plain djb2 (`raft/string-hash`) the four peers' priorities came out as
+  consecutive multiples of 33 — the multiplier — so the highest node id won every
+  round of every slot and the growing-leader-set convergence argument was
+  inoperative. Composing djb2 with `rng/next-word`, which is what `raft` does, is
+  *also* not enough: xorshift32 is GF(2)-linear, so a structured input difference
+  survives it. Interleaving the two per character fixes it, measured. **The
+  simulation reached consensus in every run both before and after**, which is why
+  this was worth catching: a broken leader election is indistinguishable from a
+  working one until its permanent leader is partitioned away.
+
+- **`report-equivocation` has no role here.** SCP handles a conflicting statement
+  by keeping the newer one under a total order and dropping the other; there is
+  nothing to gossip and nothing to slash. §12 listed the effect as awaiting a
+  Byzantine algorithm; Tendermint validated it, and SCP declines it. That is a
+  property of the algorithm, not a defect.
+
+### Confirmed, with evidence
+
+- `send-to` (unicast) carries the entire quorum-set fetch protocol.
+- The `persist-then` barrier applies cleanly: SCP's whole ballot state is a
+  binding commitment, so `b/p/p'/h/c` is written and the statement rides in
+  `:then`. A crash test shows the node resuming at the last write that *landed*,
+  not the last one issued.
+- In-machine retransmission is again required, exactly as §13 reported for
+  Tendermint. SCP needs it more, not less: its statements are cumulative state
+  rather than a per-round vote, so nothing else would ever resend one.
+- Catch-up is missing again, for the third time. A node whose slot has moved on
+  cannot help one that has not, so multi-slot sequencing is out of scope here.
+- Logical time, `.cljc` portability and the seeded simulator all held. The
+  ClojureScript run reproduces the JVM fingerprint bit for bit, including the
+  leader lottery.
+
+### Still unvalidated
+
+Instance addressing (needs HoneyBadger) and `:commit` of a multi-vertex sequence
+(needs Bullshark). Unchanged from §12.
