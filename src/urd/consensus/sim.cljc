@@ -352,6 +352,19 @@
 ;; Inspection
 ;; ============================================================
 
+(defn inject
+  "Deliver an input to a node immediately, outside the network.
+
+  Used by tests to hand a node an external stimulus -- a client request, a newly
+  mined block -- without modelling the channel it arrived on."
+  [sim peer-id input]
+  (step-node sim peer-id input))
+
+(defn inject-all
+  "Inject the same input into every live node."
+  [sim input]
+  (reduce #(inject %1 %2 input) sim (:peer-ids sim)))
+
 (defn node-state [sim peer-id] (get-in sim [:nodes peer-id :state]))
 (defn committed [sim peer-id] (get-in sim [:committed peer-id] []))
 (defn all-committed [sim] (into {} (map (juxt identity #(committed sim %))) (:peer-ids sim)))
