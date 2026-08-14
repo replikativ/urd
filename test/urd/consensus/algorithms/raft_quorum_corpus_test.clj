@@ -240,11 +240,21 @@
           membership node/cft-membership
           via-predicate
           (fn [acked]
-            (let [matches (map #(get acked % 0) ids)
+            ;; Statements must IDENTIFY THEIR SENDER. Passing bare match
+            ;; indexes -- where position encodes identity -- used to work only
+            ;; because `quorum?` counted statements rather than distinct
+            ;; senders, which was a safety hole: three copies of one
+            ;; validator's vote cleared a quorum of four. Closing that hole
+            ;; exposed this misuse, which is the more useful finding: a Raft
+            ;; commit index is a QUANTILE over per-peer values, not a quorum
+            ;; predicate over attributable statements, and only coincides with
+            ;; one when each value is tagged with the peer it came from.
+            (let [matches (map (fn [id] {:from id :match (get acked id 0)}) ids)
                   state {:validators ids}]
-              (->> (cons 0 (distinct matches))
+              (->> (cons 0 (distinct (map :match matches)))
                    (filter #(node/quorum?
-                             membership state matches (fn [m] (>= m %))))
+                             membership state matches
+                             (fn [s] (>= (:match s) %))))
                    (reduce max 0))))]
       (doseq [acked [{}
                      {:a 5}
