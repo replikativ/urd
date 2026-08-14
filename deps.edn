@@ -8,8 +8,10 @@
         buddy/buddy-core {:mvn/version "1.12.0-430"}
         buddy/buddy-sign {:mvn/version "3.6.1-359"}
 
-        ;; Content-addressed UUIDs
-        org.replikativ/hasch {:mvn/version "0.3.96"}
+        ;; Content-addressed UUIDs, and the raw synchronous SHA-256 that
+        ;; Nakamoto's proof-of-work check runs on. `hasch.core/sha256` appears
+        ;; in 0.4.x only; 0.3.96 exposes no raw byte-level digest at all.
+        org.replikativ/hasch {:mvn/version "0.4.102"}
 
         ;; Async operations
         org.replikativ/superv.async {:mvn/version "0.3.50"}
