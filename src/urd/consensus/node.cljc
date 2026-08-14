@@ -129,11 +129,18 @@
   [instance-id inner]
   {:type :instance :instance-id instance-id :inner inner})
 
-(defn tick
-  "Logical clock advance. Distinct from a timer firing: some algorithms (notably
-  HoneyBadger, which is fully asynchronous) never set a timer at all."
-  [n]
-  {:type :tick :n n})
+;; There is deliberately no `tick` event.
+;;
+;; One was defined here originally, on the theory that an algorithm might want a
+;; raw clock advance distinct from a timer firing. Nothing ever delivered one --
+;; not the simulator, not any runtime -- so for five algorithms it was a
+;; documented event that could not arrive: worse than absent, because an
+;; implementer would reasonably handle it and then wait forever.
+;;
+;; An algorithm that wants a periodic wake-up arms a repeating timer, re-arming
+;; from its own handler. Nakamoto's block clock does exactly that. If a genuine
+;; need for an unconditional tick appears, add it AND deliver it in the same
+;; change.
 
 ;; ============================================================
 ;; Effects -- what a node asks the world to do
@@ -239,22 +246,42 @@
   Not one value at one height. Bullshark's commit rule can, on a single
   certificate, commit an anchor and then retroactively back-fill several
   earlier anchors together with their whole sub-DAGs -- potentially hundreds of
-  vertices at once. `index` is a globally increasing consensus index, decoupled
-  from round or height."
+  vertices at once.
+
+  `index` is the POSITION of the first vertex in the committed prefix -- not a
+  monotonically increasing counter. The two coincide for Raft, Snowman and
+  Tendermint, and come apart under a reorg: after a revert the next commit
+  reoccupies positions that were already used. Only the position is meaningful
+  to a consumer that honours `revert`, so that is what this means. (The earlier
+  docstring said \"globally increasing consensus index\", which Nakamoto
+  disproved.)"
   [vertices index]
   [:commit {:vertices (vec vertices) :index index}])
 
 (defn revert
-  "Roll the committed prefix back to `to-vertex`.
+  "Roll the committed prefix back to `to-vertex`, dropping `dropped`.
 
   Cheap on a copy-on-write substrate: reverting is moving a branch pointer to an
   older commit, because the blocks are immutable and still in the store. btcd
   confirms the principle from the other side -- at the header layer its undo log
   is empty, since every consensus quantity is a fold over the ancestor path. All
   of Bitcoin's two-phase reorg machinery exists only because its UTXO set is a
-  destructively mutated map."
-  [to-vertex]
-  [:revert {:to-vertex to-vertex}])
+  destructively mutated map.
+
+  `dropped` is REQUIRED, and naming it is what makes the effect safe. Without it
+  an interpreter holds only a flat sequence of committed vertices with no parent
+  links, so it has to SEARCH for `to-vertex` and truncate -- and then a
+  `to-vertex` that was never committed is indistinguishable from a mistyped one.
+  Both would mean \"discard everything\", so a typo would silently wipe committed
+  history. Nakamoto surfaced this: every reorg back to the root reverts to the
+  genesis vertex, which is exactly the never-committed case.
+
+  The algorithm already has the detached path -- it had to walk it to find the
+  fork point -- so this costs nothing to supply and lets an interpreter verify
+  rather than guess. An interpreter SHOULD reject a revert whose `dropped` does
+  not match the tail it currently holds."
+  [to-vertex dropped]
+  [:revert {:to-vertex to-vertex :dropped (vec dropped)}])
 
 (defn report-equivocation
   "Report provable misbehaviour by a peer.

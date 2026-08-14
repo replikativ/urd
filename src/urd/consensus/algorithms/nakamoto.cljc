@@ -462,7 +462,13 @@
         index (height state (first attach))]
     (n/result (assoc state :tip new-tip)
               (concat (when detached?
-                        [(n/revert fork)
+                        ;; The detached path is named explicitly rather than
+                        ;; left for the interpreter to search for: reverting to
+                        ;; a vertex that was never committed -- genesis, where
+                        ;; every reorg-to-root lands -- is otherwise
+                        ;; indistinguishable from a mistyped id, and both would
+                        ;; wipe committed history.
+                        [(n/revert fork (path-from state fork old-tip))
                          (n/log-effect :info
                                        {:event :reorg
                                         :fork fork
@@ -679,8 +685,12 @@
                         ;; Re-announce the committed prefix after a restart, so
                         ;; an interpreter that truncated on `:revert` is back in
                         ;; step with us.
+                        ;; On restart we do not know what the interpreter still
+                        ;; holds, so we ask it to drop whatever it has: an empty
+                        ;; `dropped` means "truncate to `to-vertex`, whatever is
+                        ;; there" rather than "drop exactly these".
                         (when (seq chain)
-                          [(n/revert (:genesis state)) (n/commit chain 1)])))))
+                          [(n/revert (:genesis state) []) (n/commit chain 1)])))))
 
   (step [_ state input]
     (case (:type input)

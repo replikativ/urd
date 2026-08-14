@@ -216,18 +216,29 @@
       ;; nodes' committed vectors kept the abandoned branch and stayed unequal
       ;; forever regardless of whether they had actually converged.
       ;;
-      ;; The truncation has to be done by SEARCH, because `[:revert
-      ;; {:to-vertex v}]` says where the prefix should now end but not what to
-      ;; drop, and an interpreter holds only a flat sequence of committed
-      ;; vertices with no parent links to walk. A `to-vertex` that was never
-      ;; committed -- the genesis block, say -- is therefore indistinguishable
-      ;; from an unknown one, and both mean "revert everything". See the PR's
-      ;; friction notes; this is an API gap, not an implementation choice.
+      ;; The effect now NAMES what it drops, so the interpreter can verify
+      ;; rather than guess. Searching for `to-vertex` and truncating -- the only
+      ;; option when the effect carried just a target -- could not tell a
+      ;; never-committed target (genesis, where every reorg-to-root lands) from
+      ;; a mistyped one, and both meant "discard everything", so a typo silently
+      ;; wiped committed history.
+      ;;
+      ;; An empty `:dropped` means "truncate to `to-vertex`, whatever is there",
+      ;; which a restarting node needs because it cannot know what we still
+      ;; hold. A non-empty one that does not match our tail is a bug in the
+      ;; algorithm and is surfaced rather than applied.
       (let [to (:to-vertex params)
+            claimed (vec (:dropped params))
             committed (vec (get-in sim [:committed peer-id] []))
             at (last (keep-indexed (fn [i v] (when (= v to) i)) committed))
             keep-n (if at (inc at) 0)
-            dropped (subvec committed keep-n)]
+            dropped (subvec committed keep-n)
+            mismatch? (and (seq claimed) (not= claimed dropped))
+            sim (if mismatch?
+                  (update sim :trace conj
+                          {:tick (:tick sim) :event :revert-mismatch :peer peer-id
+                           :claimed claimed :actual dropped})
+                  sim)]
         (-> sim
             (assoc-in [:committed peer-id] (subvec committed 0 keep-n))
             (update-in [:reverted peer-id] (fnil conj []) (:to-vertex params))
