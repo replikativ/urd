@@ -183,6 +183,32 @@
 
 (def zero-hash (apply str (repeat 64 \0)))
 
+(def ^:private hex-alphabet (set "0123456789abcdef"))
+
+(defn- u32? [n]
+  (and (number? n) (== n (long n)) (>= n 0) (< n 4294967296)))
+
+(defn- hash-hex? [s]
+  (and (string? s) (= 64 (count s)) (every? hex-alphabet s)))
+
+(defn well-formed?
+  "Are the six header fields of the right shape?
+
+  Open membership means anyone may send anything, so this is checked BEFORE the
+  header is hashed -- serializing a field that is not a uint32, or a parent hash
+  that is not 64 hex characters, would throw inside the pure state machine and
+  take the node down. btcd gets this for free from Go's static types and the
+  wire decoder; we have to do it explicitly, and it belongs at the very front
+  because everything downstream, `header-id` included, presumes it."
+  [header]
+  (and (map? header)
+       (u32? (:version header))
+       (u32? (:time header))
+       (u32? (:bits header))
+       (u32? (:nonce header))
+       (hash-hex? (:prev header))
+       (hash-hex? (:merkle-root header))))
+
 (defn- u32-le [n]
   (when (or (neg? n) (>= n 4294967296))
     (throw (ex-info "header field is not a uint32" {:n n})))
@@ -384,6 +410,7 @@
   thing with the adjustment moved outside the state machine."
   [p header now]
   (cond
+    (not (well-formed? header)) :malformed
     (not (target-valid? p (:bits header))) :unexpected-difficulty
     (not (pow-valid? header)) :high-hash
     (> (:time header) (+ now (:max-future-drift p))) :time-too-new
@@ -499,7 +526,13 @@
                                (conj unlocked (header-id h))
                                unlocked)]))
                         [state acc []]
-                        kids)]
+                        ;; SORTED. The orphan pool is a set, and set iteration
+                        ;; order is not guaranteed to be equal on the JVM and in
+                        ;; a browser. Connection order decides which of two
+                        ;; equal-work siblings is seen first, and first-seen is
+                        ;; the tie-break -- so an unsorted iteration here would
+                        ;; be a platform-dependent fork.
+                        (sort-by header-id kids))]
             (recur state (into (vec (rest pending)) unlocked) acc)))))))
 
 (def ^:private max-orphans
@@ -513,26 +546,30 @@
   Returns {:state s :effects fx}. An orphan (parent unknown) is parked and its
   parent requested; btcd's equivalent lives one layer up, in `ProcessBlock`."
   [state header from]
-  (let [id (header-id header)]
-    (cond
-      (blk state id)
-      (n/result state)
+  (if-not (well-formed? header)
+    ;; Checked before anything hashes it; see `well-formed?`.
+    (n/result (update-in state [:rejected :malformed] (fnil inc 0))
+              [(n/log-effect :warn {:event :malformed-header :from from})])
+    (let [id (header-id header)]
+      (cond
+        (blk state id)
+        (n/result state)
 
-      (blk state (:prev header))
-      (let [r (connect-one state header)]
-        (if (= :accepted (:status r))
-          (let [d (drain-orphans (:state r) id)]
-            (n/result (:state d) (concat (:effects r) (:effects d))))
-          (n/result (:state r) (:effects r))))
+        (blk state (:prev header))
+        (let [r (connect-one state header)]
+          (if (= :accepted (:status r))
+            (let [d (drain-orphans (:state r) id)]
+              (n/result (:state d) (concat (:effects r) (:effects d))))
+            (n/result (:state r) (:effects r))))
 
-      ;; Unknown parent: park it, and ask whoever sent it for the parent.
-      :else
-      (let [n-orphans (reduce + 0 (map count (vals (:orphans state))))]
-        (if (>= n-orphans max-orphans)
-          (n/result state [(n/log-effect :warn {:event :orphan-pool-full :id id})])
-          (n/result (update-in state [:orphans (:prev header)] (fnil conj #{}) header)
-                    (when from
-                      [(n/send-to from {:kind :get-header :id (:prev header)})])))))))
+        ;; Unknown parent: park it, and ask whoever sent it for the parent.
+        :else
+        (let [n-orphans (reduce + 0 (map count (vals (:orphans state))))]
+          (if (>= n-orphans max-orphans)
+            (n/result state [(n/log-effect :warn {:event :orphan-pool-full :id id})])
+            (n/result (update-in state [:orphans (:prev header)] (fnil conj #{}) header)
+                      (when from
+                        [(n/send-to from {:kind :get-header :id (:prev header)})]))))))))
 
 ;; ============================================================
 ;; Mining -- TEST ONLY
