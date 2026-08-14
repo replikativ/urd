@@ -406,26 +406,23 @@
         (update :trace conj {:tick (:tick sim) :event :restart :peer peer-id})
         (interpret-effects peer-id (or effects [])))))
 
-(defn inject
-  "Feed an event straight into a node, bypassing the network.
+;; ============================================================
+;; External stimulus
+;; ============================================================
 
-  Needed by any algorithm that reacts to a client request: `request-value` is
-  node-INITIATED, so without this there is no way to hand a proposal to a
-  running node from outside."
+(defn inject
+  "Feed an input straight into a node, bypassing the network.
+
+  This is the class of input that neither arrives over the network nor answers
+  an effect: a client request, a newly mined block, an operator command. Needed
+  by any algorithm that reacts to one, since `request-value` is node-INITIATED
+  and offers no way to hand a proposal to a running node from outside."
   [sim peer-id input]
   (step-node sim peer-id input))
 
 ;; ============================================================
 ;; Inspection
 ;; ============================================================
-
-(defn inject
-  "Deliver an input to a node immediately, outside the network.
-
-  Used by tests to hand a node an external stimulus -- a client request, a newly
-  mined block -- without modelling the channel it arrived on."
-  [sim peer-id input]
-  (step-node sim peer-id input))
 
 (defn inject-all
   "Inject the same input into every live node."

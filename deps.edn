@@ -32,6 +32,26 @@
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
 
+  ;; Run the portable (.cljc) tests under Node.
+  ;;
+  ;; This alias is not a nicety. urd claims to be a portable clj+cljs library,
+  ;; and that claim was FALSE and untested for as long as the simulator existed:
+  ;; ClojureScript's `bit-and` yields a signed 32-bit integer, so the seeded PRNG
+  ;; produced different sequences on the two platforms, and therefore different
+  ;; message delays, drop decisions and sampled peers. It survived because every
+  ;; test that could have caught it was `.clj`. A portability claim that no CI
+  ;; job exercises is not a claim, it is a comment.
+  ;;
+  ;;   clj -M:cljs-test
+  :cljs-test {:extra-paths ["test"]
+              :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
+                           org.clojure/test.check {:mvn/version "1.1.1"}}
+              :main-opts ["-m" "cljs.main"
+                          "--target" "node"
+                          "--output-dir" "target/cljs-test"
+                          "--compile-opts" "{:optimizations :none}"
+                          "-m" "urd.cljs-test-runner"]}
+
   :dev {:extra-paths ["dev"]
         :extra-deps {nrepl/nrepl {:mvn/version "1.1.0"}}}
 
