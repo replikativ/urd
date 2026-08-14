@@ -434,6 +434,57 @@
         (is (= (:pow-limit-bits p) (:bits (last slow-branch)))
             "and the slow branch has relaxed all the way back to the limit")))))
 
+;; ============================================================
+;; What the core protocol looks like from here
+;;
+;; These two tests exist to PIN findings, not to check Bitcoin. They are the
+;; evidence behind the friction notes in the namespace docstring, so that if
+;; someone later changes the protocol to fix either one, a test says so.
+;; ============================================================
+
+(deftest nothing-is-gated-behind-the-durable-write
+  (testing "the durability rule -- gate exactly the messages that constitute
+            this node's binding commitment -- has an EMPTY left-hand side under
+            proof of work. A node signs nothing, a header is self-authenticating
+            and carries its own proof, and there is no equivocation to prevent,
+            so relaying before the write lands is safe. Nakamoto is the
+            algorithm that shows `:persist-then`'s barrier is optional."
+    (let [st (scratch)
+          h (nk/mine (nk/template st {:merkle-root (tag-hex "d")}) 1000000)
+          fx (:effects (nk/process-header st h nil))
+          persists (filter #(= :persist-then (n/effect-kind %)) fx)]
+      (is (= 1 (count persists)))
+      (is (empty? (:then (n/effect-params (first persists))))
+          "nothing waits on the write")
+      (is (some #(= :broadcast (n/effect-kind %)) fx)
+          "and the relay goes out immediately, not from inside :then"))))
+
+(deftest the-commit-index-is-a-chain-position-and-goes-backwards-on-a-reorg
+  (testing "`:commit`'s `:index` is documented as a globally increasing
+            consensus index. For Raft and Snowman that coincides with the
+            position of the vertices in the committed sequence. Under a reorg it
+            cannot: after reverting to height 2 the next commit starts at
+            height 3 again. We emit the POSITION, because that is the only
+            reading a consumer that also honours `:revert` can use -- and it is
+            therefore NOT monotone. Pinned here as the finding it is."
+    (let [st0 (scratch)
+          g (:tip st0)
+          [st1 main] (build st0 g 5 "main")
+          [_ side] (build st1 (nk/header-id (nth main 1)) 6 "side")
+          fresh (reduce (fn [s h] (:state (nk/process-header s h nil))) (scratch) main)
+          r (reduce (fn [acc h]
+                      (let [res (nk/process-header (:state acc) h nil)]
+                        {:state (:state res) :effects (into (:effects acc) (:effects res))}))
+                    {:state fresh :effects []}
+                    side)
+          indices (->> (:effects r)
+                       (filter #(= :commit (n/effect-kind %)))
+                       (map #(:index (n/effect-params %))))]
+      (is (= 3 (first indices))
+          "the reorg re-commits from height 3, below where main had reached")
+      (is (not (apply <= (concat [5] indices)))
+          "so the index sequence across the whole run is not monotone"))))
+
 (defspec cumulative-work-never-decreases-along-a-chain 50
   (prop/for-all [n (gen/choose 1 8)]
                 (let [[st hs] (build (scratch) (:tip (scratch)) n "w")
@@ -485,6 +536,27 @@
       (is (= :time-too-new (nk/check-header-sanity p solved 1600000000)))
       (is (nil? (nk/check-header-sanity p solved (+ 1600000000 10000)))
           "the same header is fine to a node whose clock has caught up"))))
+
+(deftest a-malformed-header-is-rejected-without-crashing-the-machine
+  (testing "open membership means anyone may send anything. btcd gets field
+            shapes for free from Go's types and its wire decoder; here a
+            timestamp that is not a uint32, or a parent hash that is not 64 hex
+            characters, would throw while SERIALIZING -- inside a pure state
+            machine, taking the node down. So it is checked before the hash."
+    (let [st (scratch)
+          good (nk/mine (nk/template st {:merkle-root (tag-hex "m")}) 1000000)]
+      (is (nk/well-formed? good))
+      (doseq [bad [(assoc good :time -1)
+                   (assoc good :nonce 4294967296)
+                   (assoc good :time 1.5)
+                   (assoc good :prev "not-a-hash")
+                   (assoc good :prev (subs nk/zero-hash 1))
+                   (assoc good :merkle-root (str "ZZ" (subs nk/zero-hash 2)))
+                   (dissoc good :bits)]]
+        (is (not (nk/well-formed? bad)) (pr-str bad))
+        (let [r (nk/process-header st bad :peer)]
+          (is (= 1 (get-in (:state r) [:rejected :malformed])))
+          (is (= [:log] (map n/effect-kind (:effects r)))))))))
 
 (deftest a-header-with-an-unknown-parent-is-parked-not-rejected
   (let [st0 (scratch)
@@ -591,6 +663,77 @@
                           st (sim/node-state s' :m1)]
                       (recur s' (rest hs) (conj acc (nk/tip-work st))))))]
       (is (every? (fn [[x y]] (bn/ge y x)) (partition 2 1 works))))))
+
+(defn- mine-on-node
+  "Mine one block on whatever `peer` currently believes the tip is, and inject
+  it into that peer -- the seam a real miner would use. Everything the miner
+  needs is a pure query on the node's own state; it gets no privileged access."
+  [s peer tag]
+  (let [st (sim/node-state s peer)
+        tpl (nk/template st {:merkle-root (tag-hex tag)})
+        h (nk/mine tpl 1000000)]
+    (sim/inject s peer (n/vertex-received h))))
+
+(deftest an-equal-work-tie-is-not-resolved-by-the-protocol
+  (testing "two branches of exactly equal work leave two nodes on different
+            tips, permanently, because each keeps whichever it saw FIRST.
+
+            This is not a bug and not a liveness failure -- it is what `>`
+            rather than `>=` means, and Bitcoin has no tie-break to fall back
+            on. The split persists until somebody mines on top of one of them.
+            Any test that expects competing miners to converge without a
+            subsequent block is asserting something Nakamoto does not promise."
+    (let [st0 (scratch)
+          g (:tip st0)
+          [st1 x] (build st0 g 2 "X")
+          [st2 y] (build st1 g 2 "Y")
+          s (-> (fresh-sim)
+                (deliver-headers :m1 x)
+                (deliver-headers :m1 y)
+                (deliver-headers :m2 y)
+                (deliver-headers :m2 x)
+                (sim/run 60))]
+      (is (= (nk/header-id (last x)) (:tip (sim/node-state s :m1))))
+      (is (= (nk/header-id (last y)) (:tip (sim/node-state s :m2))))
+      (is (not (sim/agreement? s)))
+      (testing "and one more block on either branch ends it immediately"
+        (let [[_ z] (build st2 (nk/header-id (last y)) 1 "Z")
+              healed (-> s (sim/inject :m1 (n/vertex-received (first z))) (sim/run 60))]
+          (is (sim/agreement? healed))
+          (is (apply = (map #(:tip (sim/node-state healed %)) peers))))))))
+
+(defspec competing-miners-converge 15
+  (testing "two miners racing on the same network, with delivery order drawn
+            from the seed. They repeatedly find blocks on top of different tips,
+            so this exercises reorgs rather than merely fork choice.
+
+            The race ends with one uncontested block, because an equal-work tie
+            is genuinely unresolved until someone extends one side -- see
+            `an-equal-work-tie-is-not-resolved-by-the-protocol`."
+    (prop/for-all [seed (gen/choose 1 100000)
+                   gaps (gen/vector (gen/choose 1 4) 12 12)]
+                  (let [s (reduce (fn [s [i gap]]
+                                    (-> s
+                                        (mine-on-node (if (even? i) :m1 :m2)
+                                                      (str "r" i))
+                                        (sim/run gap)))
+                                  (sim/make {:seed seed
+                                             :nodes (zipmap peers (repeat (nk/create)))
+                                             :node-config (zipmap peers (repeat {:params easy-params
+                                                                                 :genesis test-genesis
+                                                                                 :now 2000000000}))})
+                                  (map-indexed vector gaps))
+                        s (-> (sim/run s 60) (mine-on-node :m1 "final") (sim/run 120))
+                        tips (map #(:tip (sim/node-state s %)) peers)
+                        committed (vals (sim/all-committed s))]
+                    (and (sim/agreement? s)
+                         (apply = tips)
+                         (apply = committed)
+                         ;; and the committed sequence really is the chain
+                         (= (first committed)
+                            (nk/path-from (sim/node-state s :m1)
+                                          (:genesis (sim/node-state s :m1))
+                                          (first tips))))))))
 
 (deftest nakamoto-is-deterministic
   (let [[_ hs] (build (scratch) (:tip (scratch)) 5 "d")
