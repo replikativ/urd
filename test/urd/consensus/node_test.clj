@@ -58,12 +58,31 @@
 ;; ============================================================
 
 (deftest quorum-respects-voting-power
-  (testing "with power supplied, a quorum is summed weight, not head count"
+  (testing "with power supplied, BOTH sides are weight
+
+           This test previously asserted the opposite, and the assertion was
+           the bug: it compared :a's 3 power against `byzantine-threshold(4)`,
+           the threshold for the validator COUNT, and concluded that half the
+           power of a four-node cluster was a Byzantine quorum. The threshold
+           for 6 total power is 5."
     (let [weighted (assoc four :voting-power {:a 3 :b 1 :c 1 :d 1})]
-      (is (true? (n/quorum? n/bft-membership weighted [{:from :a}] (constantly true)))
-          ":a alone holds 3 of 6 power, meeting the threshold of 3")
+      (is (= 5 (n/byzantine-threshold 6)))
+      (is (false? (n/quorum? n/bft-membership weighted [{:from :a}] (constantly true)))
+          ":a alone holds 3 of 6 power, which is not a Byzantine quorum")
+      (is (false? (n/quorum? n/bft-membership weighted
+                             [{:from :a} {:from :b}] (constantly true)))
+          "4 of 6 is still short")
+      (is (true? (n/quorum? n/bft-membership weighted
+                            [{:from :a} {:from :b} {:from :c}] (constantly true)))
+          "5 of 6 clears it")
       (is (false? (n/quorum? n/bft-membership weighted [{:from :b}] (constantly true)))
-          ":b alone holds 1"))))
+          ":b alone holds 1")))
+  (testing "uniform power is exactly the unweighted case"
+    (let [uniform (assoc four :voting-power {:a 1 :b 1 :c 1 :d 1})]
+      (is (= (n/quorum? n/bft-membership four [{:from :a} {:from :b} {:from :c}]
+                        (constantly true))
+             (n/quorum? n/bft-membership uniform [{:from :a} {:from :b} {:from :c}]
+                        (constantly true)))))))
 
 ;; ============================================================
 ;; The f+1 identity

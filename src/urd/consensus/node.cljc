@@ -404,6 +404,29 @@
                       {:state-keys (keys state)})))
     (count vs)))
 
+(defn- total-weight
+  "The universe the threshold is measured against.
+
+  The head count when weights are uniform, the summed weight when they are not
+  -- and the two must be the SAME quantity as the one being compared against
+  it. Getting this wrong is a silent safety hole rather than an off-by-one:
+  the original implementation summed per-validator STAKE on one side and
+  applied `threshold-fn` to the HEAD COUNT on the other, so with four
+  validators of power ten each, a single statement cleared
+  `byzantine-threshold(4) = 3` and was reported as a Byzantine quorum. The
+  correct threshold there is `byzantine-threshold(40) = 27`.
+
+  It survived review because it is stated correctly in the docstring, tested by
+  an assertion that encodes the bug as the expectation, and invisible while
+  every algorithm using it happens to run uniform weights. Bullshark is the
+  first algorithm whose thresholds are genuinely over stake, and it does not
+  use `Membership` at all -- which is how this came out."
+  [state validators]
+  (let [powers (:voting-power state)]
+    (if (seq powers)
+      (reduce + 0 (map #(get powers % 0) validators))
+      (count validators))))
+
 (defn- distinct-voters
   "The DISTINCT senders among statements satisfying `pred`.
 
@@ -426,16 +449,18 @@
 (defrecord ThresholdMembership [threshold-fn voter-fn]
   Membership
   (quorum? [this state statements pred]
-    (let [n (validator-count state)
+    (validator-count state)
+    (let [total (total-weight state (:validators state))
           voters (distinct-voters voter-fn statements pred)
           w (reduce + 0 (map #(weight this state %) voters))]
-      (>= w (threshold-fn n))))
+      (>= w (threshold-fn total))))
   (v-blocking? [this state statements pred]
     ;; A set blocks if its complement can no longer reach the threshold.
-    (let [n (validator-count state)
+    (validator-count state)
+    (let [total (total-weight state (:validators state))
           voters (distinct-voters voter-fn statements pred)
           w (reduce + 0 (map #(weight this state %) voters))]
-      (> w (- n (threshold-fn n)))))
+      (> w (- total (threshold-fn total)))))
   (weight [_ state peer-id]
     ;; Uniform unless the state supplies per-validator power.
     (get (:voting-power state) peer-id 1)))
@@ -470,7 +495,9 @@
 
   `voter-fn` extracts the sender from a statement; defaults to `:from`. Per
   validator voting power may be supplied as `:voting-power` in the state, in
-  which case a quorum is measured by summed weight rather than head count."
+  which case BOTH sides of the comparison move to weight: the threshold is
+  computed from the total power of the validator set, not from its size. See
+  `total-weight` for why that is spelled out rather than assumed."
   ([threshold-fn] (threshold-membership threshold-fn :from))
   ([threshold-fn voter-fn] (->ThresholdMembership threshold-fn voter-fn)))
 

@@ -308,10 +308,24 @@
             (assoc sim :inflight remaining)
             due)))
 
-(defn- fire-due-timers [sim]
+(defn- fire-due-timers
+  "Fire every armed timer whose deadline has passed, in a reproducible order.
+
+  Sorted by the PRINTED timer id rather than by the id itself. Sorting by the
+  id directly silently constrains what a timer id may be: `compare` throws on
+  two values of different types, so a node that armed `:gossip` and
+  `[:anchor 3]` crashed the simulator from inside its own scheduling loop, with
+  a ClassCastException naming neither the node nor the timer. Nothing in the
+  effect API said timer ids had to be mutually comparable, and an algorithm
+  that wants one timer per round -- Bullshark wants exactly that -- reaches for
+  a compound id immediately. Printing first is a total order over any ids at
+  all, and coincides with the old one for the keyword ids every algorithm here
+  uses."
+  [sim]
   (let [t (:tick sim)
         due (for [peer-id (:peer-ids sim)
-                  [timer-id fire-at] (sort-by key (get-in sim [:timers peer-id] {}))
+                  [timer-id fire-at] (sort-by (comp pr-str key)
+                                              (get-in sim [:timers peer-id] {}))
                   :when (<= fire-at t)]
               [peer-id timer-id])]
     (reduce (fn [s [peer-id timer-id]]
