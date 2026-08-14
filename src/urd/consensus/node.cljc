@@ -335,15 +335,29 @@
   (weight [this state peer-id]
     "This peer's weight: stake, work, or 1 for the uniform case."))
 
+(defn- validator-count
+  "The validator-set size, insisting the key is actually there.
+
+  Guarding this is not pedantry. `(count nil)` is 0, and every threshold
+  function maps 0 to 1, so a state that merely FORGOT `:validators` would report
+  that a single statement constitutes a quorum -- a silent safety failure that
+  looks like normal operation. Failing loudly is the only safe behaviour."
+  [state]
+  (let [vs (:validators state)]
+    (when (or (nil? vs) (zero? (count vs)))
+      (throw (ex-info "membership needs a non-empty :validators in state"
+                      {:state-keys (keys state)})))
+    (count vs)))
+
 (defrecord ThresholdMembership [threshold-fn]
   Membership
   (quorum? [_ state statements pred]
-    (let [n (count (:validators state))
+    (let [n (validator-count state)
           k (count (filter pred statements))]
       (>= k (threshold-fn n))))
   (v-blocking? [_ state statements pred]
     ;; A set blocks if its complement can no longer reach the threshold.
-    (let [n (count (:validators state))
+    (let [n (validator-count state)
           k (count (filter pred statements))]
       (> k (- n (threshold-fn n)))))
   (weight [_ _ _] 1))
