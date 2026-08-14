@@ -29,10 +29,22 @@
     FINGERPRINT {:roles [:follower :follower :follower :follower :leader],
                  :terms [1 1 1 1 1],
                  :commits [53 53 53 53 54],
-                 :committed-counts [53 53 53 53 54]}"
+                 :committed-counts [53 53 53 53 54]}
+
+    TENDERMINT-FINGERPRINT
+      {:heights [17 17 17 17],
+       :rounds [0 0 0 0],
+       :decided [[:n1 0 0] [:n3 1 1] [:n3 2 0] [:n4 3 0] [:n1 4 0] [:n2 5 0]
+                 [:n3 6 0] [:n4 7 0] [:n1 8 0] [:n2 9 0] [:n3 10 0] [:n4 11 0]
+                 [:n1 12 0] [:n2 13 0] [:n3 14 0] [:n4 15 0] [:n1 16 0]]}
+
+  The Tendermint line is the stronger of the two, because the round-1 decision
+  at height 1 means the run actually took a timeout path: it pins the timeout
+  schedule and the proposer rotation, not just the happy case."
   (:require [clojure.test :as t]
             [urd.consensus.portability-test]
             [urd.consensus.algorithms.raft :as raft]
+            [urd.consensus.algorithms.tendermint :as tm]
             [urd.consensus.sim :as sim]))
 
 (def peers [:n1 :n2 :n3 :n4 :n5])
@@ -53,8 +65,34 @@
      :commits (mapv #(:commit (sim/node-state s %)) peers)
      :committed-counts (mapv #(count (sim/committed s %)) peers)}))
 
+(def tm-peers [:n1 :n2 :n3 :n4])
+
+(defn tendermint-fingerprint
+  "A four-node Tendermint run under 20% message loss, reduced to a value.
+
+  Chosen because it exercises every source of platform-dependent arithmetic in
+  the port at once: proposer priorities (three different integer divisions),
+  quorum thresholds, the logical timeout schedule, and the RNG-driven drop and
+  delay decisions that decide which round each height lands in."
+  []
+  (let [s (sim/run (sim/make {:seed 42
+                              :nodes (zipmap tm-peers (repeat (tm/make)))
+                              :node-config (zipmap tm-peers
+                                                   (repeat {:timeout-propose 20
+                                                            :timeout-prevote 15
+                                                            :timeout-precommit 15
+                                                            :timeout-delta 5}))
+                              :config {:drop-rate 0.2
+                                       :value-fn (fn [_ p ctx]
+                                                   {:id [p (:height ctx) (:round ctx)]})}})
+                   300)]
+    {:heights (mapv #(:height (sim/node-state s %)) tm-peers)
+     :rounds (mapv #(:round (sim/node-state s %)) tm-peers)
+     :decided (mapv :id (sim/committed s :n1))}))
+
 (defn -main [& _]
   (t/run-tests 'urd.consensus.portability-test)
-  (println "FINGERPRINT" (pr-str (fingerprint))))
+  (println "FINGERPRINT" (pr-str (fingerprint)))
+  (println "TENDERMINT-FINGERPRINT" (pr-str (tendermint-fingerprint))))
 
 (set! *main-cli-fn* -main)
