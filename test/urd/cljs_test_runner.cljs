@@ -8,6 +8,7 @@
 
   Exits non-zero on failure so CI actually fails."
   (:require [clojure.test :as t]
+            [urd.consensus.algorithms.scp-portability-test]
             [urd.consensus.portability-test]
             [urd.consensus.sim-portability-test]))
 
@@ -18,7 +19,8 @@
     (js/process.exit 1)))
 
 (defn -main [& _]
-  (t/run-tests 'urd.consensus.portability-test
+  (t/run-tests 'urd.consensus.algorithms.scp-portability-test
+               'urd.consensus.portability-test
                'urd.consensus.sim-portability-test))
 
 (set! *main-cli-fn* -main)
