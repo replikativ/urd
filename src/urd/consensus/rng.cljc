@@ -14,10 +14,23 @@
 
   ## Portability
 
-  ClojureScript's bit operations coerce to 32-bit signed integers; Clojure's act
-  on 64-bit longs. Every operation here therefore masks back to 32 bits with
-  `mask32`, so both platforms produce identical sequences. The tests assert this
-  by pinning a known sequence.
+  ClojureScript's bit operations coerce to 32-bit SIGNED integers; Clojure's act
+  on 64-bit longs. Every operation here therefore normalizes back to an unsigned
+  32-bit VALUE with `mask32`, so both platforms produce identical sequences. The
+  tests pin a known sequence, and `rng-agrees-across-platforms` in
+  `urd.consensus.portability-test` is the one that must be run under BOTH.
+
+  `bit-and` alone is not enough, and this was a real bug: in ClojureScript
+  `(bit-and 0xFFFFFFFF 0xFFFFFFFF)` is -1, not 4294967295. The bit PATTERN is
+  right but the NUMBER is negative, and the two places that treat the word as a
+  number rather than as bits -- `next-int`'s rejection bound and its `mod` --
+  then take different branches. Measured before the fix, `next-int` with seed 7
+  and bound 100 gave [83 55 7 45 67 56 62 87] on the JVM and
+  [83 55 11 49 71 56 62 87] under Node. So the simulator's message delays, drop
+  decisions and peer sampling all differed between platforms, which is precisely
+  what this namespace exists to prevent. The extra `unsigned-bit-shift-right`
+  by zero is a no-op on the JVM and is the standard `>>> 0` coercion to an
+  unsigned value in JavaScript.
 
   ## Purity
 
@@ -28,7 +41,10 @@
 
 (def ^:private mask 0xFFFFFFFF)
 
-(defn- mask32 [x] (bit-and x mask))
+(defn- mask32
+  "The low 32 bits of `x`, as a NON-NEGATIVE number on both platforms."
+  [x]
+  (unsigned-bit-shift-right (bit-and x mask) 0))
 
 (defn make
   "Create a generator from a seed. Seed 0 is remapped, since xorshift has 0 as a
