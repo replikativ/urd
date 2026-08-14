@@ -57,6 +57,11 @@
               :rng (rng/make seed)
               :seed seed
               :peer-ids peer-ids
+              ;; Kept so `restart` can rebuild a node with the same
+              ;; configuration it was created with. Without this a restarted
+              ;; node silently loses its per-node config, which is exactly the
+              ;; kind of difference that makes a durability test lie.
+              :node-config (or node-config {})
               :nodes {}
               :timers {}
               :inflight []
@@ -77,7 +82,7 @@
                     {:keys [state effects]} (node/init impl cfg')]
                 (-> sim
                     (assoc-in [:nodes peer-id] {:impl impl :state state})
-                    (assoc-in [:storage peer-id] {:durable {} :writes []})
+                    (assoc-in [:storage peer-id] {:durable {} :writes [] :landed []})
                     (assoc-in [:committed peer-id] [])
                     (#(interpret-effects % peer-id (or effects []))))))
             base
@@ -158,14 +163,18 @@
       :persist-then
       (let [{:keys [writes durable? epoch then truncate-from]} params
             token (:next-msg-id sim)
-            at (+ (:tick sim) (if durable? (get-in sim [:config :persist-latency]) 0))]
+            at (+ (:tick sim) (if durable? (get-in sim [:config :persist-latency]) 0))
+            record {:tick (:tick sim) :writes writes :durable? durable?
+                    :truncate-from truncate-from}]
         (-> sim
             (update :next-msg-id inc)
-            (update-in [:storage peer-id :writes] conj
-                       {:tick (:tick sim) :writes writes :durable? durable?
-                        :truncate-from truncate-from})
+            ;; `:writes` records every write that was ISSUED, whether or not it
+            ;; landed. `:durable` (below, in complete-due-persists) records only
+            ;; those that landed, and is the only thing a restart may see.
+            (update-in [:storage peer-id :writes] conj record)
             (update-in [:pending-persist peer-id] (fnil conj [])
-                       {:token token :epoch epoch :then then :at at})))
+                       {:token token :epoch epoch :then then :at at
+                        :record record})))
 
       :sample
       (let [{:keys [request-id k from]} params
@@ -275,8 +284,15 @@
        (let [pending (get-in s [:pending-persist peer-id] [])
              due (filter #(<= (:at %) t) pending)
              remaining (vec (remove #(<= (:at %) t) pending))]
-         (reduce (fn [s2 {:keys [token epoch then]}]
+         (reduce (fn [s2 {:keys [token epoch then record]}]
                    (-> s2
+                       ;; The write is now on disk and survives a crash. This is
+                       ;; the ONLY place durable state grows; a write that was
+                       ;; issued but never completed is genuinely lost, which is
+                       ;; what makes a crash-before-fsync test mean anything.
+                       (update-in [:storage peer-id :landed] (fnil conj []) record)
+                       (update-in [:storage peer-id :durable]
+                                  merge (:writes record))
                        ;; The node learns the write landed...
                        (step-node peer-id (node/persisted token epoch))
                        ;; ...and only THEN do the gated effects go out. This is
@@ -335,18 +351,41 @@
   In-memory state is discarded and `init` runs again, so anything the algorithm
   failed to persist is genuinely lost -- which is the point. A node that keeps
   its term in memory but not on disk will fail here, exactly as it would in
-  production."
+  production.
+
+  `:restored` carries two views of the same thing, because algorithms differ in
+  what they need. `:durable` is the merge of every landed write, which suits an
+  algorithm whose durable state is a small record. `:writes` is the ORDERED log
+  of landed writes, which an algorithm with an append-only log must replay --
+  merging cannot express `truncate-from`, and a later append at a lower index
+  has to overwrite rather than union."
   [sim peer-id]
   (let [impl (get-in sim [:nodes peer-id :impl])
-        durable (get-in sim [:storage peer-id :durable] {})
-        cfg {:peer-id peer-id :validators (:peer-ids sim) :restored durable}
+        storage (get-in sim [:storage peer-id] {})
+        cfg (merge {:peer-id peer-id
+                    :validators (:peer-ids sim)
+                    :restored {:durable (:durable storage {})
+                               :writes (:landed storage [])}}
+                   (get-in sim [:node-config peer-id]))
         {:keys [state effects]} (node/init impl cfg)]
     (-> sim
         (update :crashed disj peer-id)
         (assoc-in [:nodes peer-id :state] state)
         (update :timers dissoc peer-id)
+        ;; Writes that were in flight when the node died never landed, so they
+        ;; must not land after it comes back.
+        (assoc-in [:pending-persist peer-id] [])
         (update :trace conj {:tick (:tick sim) :event :restart :peer peer-id})
         (interpret-effects peer-id (or effects [])))))
+
+(defn inject
+  "Feed an event straight into a node, bypassing the network.
+
+  Needed by any algorithm that reacts to a client request: `request-value` is
+  node-INITIATED, so without this there is no way to hand a proposal to a
+  running node from outside."
+  [sim peer-id input]
+  (step-node sim peer-id input))
 
 ;; ============================================================
 ;; Inspection
