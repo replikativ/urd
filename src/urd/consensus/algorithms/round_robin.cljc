@@ -49,7 +49,30 @@
     (= proposer (:peer-id state))))
 
 (defn quorum-size
-  "Calculate quorum size (simple majority)."
+  "CRASH-fault-tolerant quorum: a simple majority, floor(n/2) + 1.
+
+  This is deliberately NOT the Byzantine threshold, and the difference is not an
+  oversight -- read before 'fixing' it to match `urd.crypto/has-quorum?`.
+
+  Round-robin is a CFT reference algorithm. It has a fixed proposer per height,
+  no locking, and no equivocation handling, so it is not Byzantine-safe at ANY
+  threshold: a faulty proposer can equivocate and nothing here detects it.
+  Raising the threshold would cost liveness while buying no safety.
+
+      n | CFT majority | BFT floor(2n/3)+1 | f = floor((n-1)/3)
+      3 |      2       |         3         |        0
+      4 |      3       |         3         |        1
+      5 |      3       |         4         |        1
+      7 |      4       |         5         |        2
+
+  Note n=3 tolerates ZERO Byzantine faults, so its Byzantine quorum is
+  unanimity -- which is why a 3-validator cluster is a CFT configuration only.
+
+  `urd.crypto/has-quorum?` uses the Byzantine threshold because it validates
+  CERTIFICATES, which are meant to be checkable by third parties under an
+  adversarial assumption. The two are different threat models and are supposed
+  to differ. `quorum-thresholds-are-intentionally-different` in the generative
+  tests pins that."
   [validator-set]
   (inc (quot (count validator-set) 2)))
 

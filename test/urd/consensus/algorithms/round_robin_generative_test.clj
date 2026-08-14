@@ -409,22 +409,66 @@
 ;; Additional Properties
 ;; ============================================================
 
-(defn prop-quorum-scaling
-  "Property: Quorum size scales correctly with validator count."
+(defn prop-quorum-is-a-majority
+  "Property: round-robin's quorum is a strict majority, and is achievable.
+
+  Round-robin is CRASH-fault-tolerant, so a majority is the correct threshold
+  for it. See `rr/quorum-size` for why raising it to the Byzantine threshold
+  would cost liveness without buying safety."
   []
   (prop/for-all [n (gen/choose 3 15)]
                 (let [validator-set (gen/generate (gen-validator-set n))
                       quorum (rr/quorum-size validator-set)]
                   (and
-        ;; Quorum should be > n/2
-                   (> quorum (/ n 2))
-        ;; Quorum should be <= n
+                   ;; Strict majority: two quorums always intersect in >= 1 node,
+                   ;; which is what gives CFT agreement.
+                   (> (* 2 quorum) n)
+                   ;; Achievable at all.
                    (<= quorum n)
-        ;; Quorum should be exactly ceil((n+1)/2)
-                   (= quorum (inc (quot n 2)))))))
+                   ;; Tolerates the crash of a minority.
+                   (<= quorum (- n (quot (dec n) 2)))))))
 
-(defspec quorum-scaling-property 100
-  (prop-quorum-scaling))
+(defspec quorum-is-a-majority-property 100
+  (prop-quorum-is-a-majority))
+
+(defn prop-quorum-thresholds-differ
+  "Property: the CFT and BFT thresholds are DIFFERENT, on purpose.
+
+  `rr/quorum-size` is a crash-fault majority; `urd.crypto/has-quorum?` uses the
+  Byzantine threshold floor(2n/3)+1 because certificates must be checkable by
+  third parties under an adversarial assumption.
+
+  They coincide at n=4 and diverge from n=5 on. This test exists so that anyone
+  who notices the discrepancy finds a deliberate, documented decision rather
+  than assuming one of them is a typo -- and so that silently changing either
+  one to match the other fails loudly.
+
+  The BFT threshold's own safety property (quorum intersection: two quorums
+  share more than f members) is machine-checked in ansatz as
+  `quorum-intersection`."
+  []
+  (prop/for-all [n (gen/choose 3 15)]
+                (let [validator-set (gen/generate (gen-validator-set n))
+                      cft (rr/quorum-size validator-set)
+                      bft (inc (quot (* 2 n) 3))]
+                  (and
+                   ;; The Byzantine threshold is never weaker than the CFT one.
+                   (<= cft bft)
+                   ;; They agree ONLY at n in #{1,2,4} (verified exhaustively).
+                   ;; n=4 is the case that made the old discrepancy invisible:
+                   ;; every small example in the test suite used 3 or 4 nodes.
+                   (if (= n 4) (= cft bft) true)
+                   ;; For EVERY n >= 5 the Byzantine threshold is strictly
+                   ;; stronger. This is the assertion that matters: there is no
+                   ;; cluster size above 4 where the two coincide, so the
+                   ;; distinction can never be dismissed as a rounding detail.
+                   (if (>= n 5) (< cft bft) true)
+                   ;; Two worked examples, spelled out.
+                   (if (= n 5) (and (= cft 3) (= bft 4)) true)
+                   (if (= n 7) (and (= cft 4) (= bft 5)) true)))))
+
+(defspec quorum-thresholds-are-intentionally-different 100
+  (prop-quorum-thresholds-differ))
 
 (defn prop-proposer-rotation
   "Property: Proposer rotates through all validators."

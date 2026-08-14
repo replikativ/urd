@@ -6,9 +6,26 @@
 
 > *In Norse mythology, [Urðr](https://en.wikipedia.org/wiki/Urðr) (Old Norse: "fate") is one of the three Norns who carve runes into Yggdrasil, establishing immutable truth.*
 
-**Urd** - Byzantine Fault Tolerant consensus for distributed copy-on-write systems.
+**Urd** - a pure functional consensus framework for distributed copy-on-write systems.
 
-A pure functional consensus framework designed to coordinate finalization across heterogeneous storage systems (Datahike, Git, ZFS, IPFS, etc.) using [Yggdrasil](https://github.com/replikativ/yggdrasil) snapshot protocols.
+Designed to coordinate finalization across heterogeneous storage systems (Datahike, Git, ZFS, IPFS, etc.) using [Yggdrasil](https://github.com/replikativ/yggdrasil) snapshot protocols.
+
+> ### ⚠️ Status: pre-alpha. Not Byzantine fault tolerant end-to-end yet.
+>
+> Earlier versions of this README described Urd as Byzantine fault tolerant without
+> qualification. That overstated what is implemented. Precisely:
+>
+> - **The cryptographic layer is real.** `urd.crypto` does genuine ED25519 signing and
+>   verification, and its `has-quorum?` uses the correct Byzantine threshold.
+> - **The consensus layer does not yet use it.** The round-robin reference algorithm
+>   accepts votes *without verifying their signatures*, and the runtime records a
+>   placeholder in place of a real one. A malicious peer can therefore forge votes.
+>   Until that is closed, the system tolerates crash faults, not Byzantine ones.
+> - **Round-robin is a reference implementation**, not a production algorithm. It is
+>   here to exercise the state-machine abstraction.
+>
+> Byzantine fault tolerance is the goal and the design target; it is not a current
+> property. Do not deploy this against an adversarial validator set.
 
 ## Why Urd?
 
