@@ -153,6 +153,26 @@
   [topic msg]
   [:broadcast {:topic topic :msg msg}])
 
+(defn deliver-self
+  "Hand an input back to this same node, without going through the network.
+
+  Added after implementing Raft, which could not otherwise express etcd's
+  self-addressed `MsgAppResp` (`raft.go:845`). That trick is worth having: the
+  leader models its OWN durability as a message from itself to itself, delayed
+  by the fsync, which removes the leader/follower asymmetry from commit-index
+  advancement entirely -- the leader's entry counts toward the quorum only once
+  its own write is durable, exactly like everyone else's.
+
+  `[:send {:to self}]` is NOT a substitute. It traverses the network, where a
+  configured drop rate can lose it, and etcd's own invariant is that a message
+  in `msgs` may never be self-addressed (`raft.go:595-597`).
+
+  Delivered at the next tick rather than inline, so a node cannot recurse into
+  itself within a single step. Never dropped, never partitioned. Placed inside
+  `persist-then`'s `:then` it gives exactly the etcd semantics."
+  [input]
+  [:deliver-self {:input input}])
+
 (defn persist-then
   "Durably write `writes`, THEN emit `then`.
 
@@ -175,11 +195,19 @@
   to infer a truncation from an append at a lower index -- which is a classic
   source of storage bugs. We make it explicit.
 
-  `epoch` is echoed back in the `persisted` event; see that function."
-  [{:keys [writes durable? epoch truncate-from then]
+  `epoch` is echoed back in the `persisted` event; see that function.
+
+  `token` is supplied BY THE CALLER and echoed back unchanged. It was originally
+  minted by the interpreter, which meant a node could not correlate a completion
+  with the write that caused it -- so an algorithm with more than one write in
+  flight had to assume the interpreter completes them in issue order, an
+  ordering the protocol never promised. Raft surfaced this. Supply whatever
+  correlates for you; it is opaque here."
+  [{:keys [writes durable? epoch truncate-from then token]
     :or {durable? true then []}}]
   [:persist-then (cond-> {:writes writes :durable? durable? :epoch epoch :then then}
-                   truncate-from (assoc :truncate-from truncate-from))])
+                   truncate-from (assoc :truncate-from truncate-from)
+                   token (assoc :token token))])
 
 (defn sample
   "Ask for `k` peers, drawn by the runtime/simulator.

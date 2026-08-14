@@ -65,6 +65,7 @@
               :nodes {}
               :timers {}
               :inflight []
+              :self-inbox []
               :next-msg-id 0
               :partitions nil
               :crashed #{}
@@ -160,9 +161,20 @@
               sim
               (:peer-ids sim))
 
+      :deliver-self
+      ;; Delivered at the next tick, never dropped, never partitioned. Queued
+      ;; rather than applied inline so a node cannot recurse into itself within
+      ;; a single step.
+      (update sim :self-inbox (fnil conj []) {:at (inc (:tick sim))
+                                              :peer peer-id
+                                              :input (:input params)})
+
       :persist-then
       (let [{:keys [writes durable? epoch then truncate-from]} params
-            token (:next-msg-id sim)
+            ;; Caller-supplied token when present; the interpreter only invents
+            ;; one as a fallback, because a node that cannot name its own write
+            ;; cannot correlate the completion with it.
+            token (or (:token params) (:next-msg-id sim))
             at (+ (:tick sim) (if durable? (get-in sim [:config :persist-latency]) 0))
             record {:tick (:tick sim) :writes writes :durable? durable?
                     :truncate-from truncate-from}]
@@ -303,11 +315,27 @@
      sim
      (:peer-ids sim))))
 
+(defn- deliver-self-inbox
+  "Deliver inputs a node addressed to itself.
+
+  Runs BEFORE network delivery: a node's own conclusions about what it has
+  already done should be visible to it before it processes anything new. Sorted
+  for reproducibility."
+  [sim]
+  (let [t (:tick sim)
+        inbox (:self-inbox sim)
+        due (->> inbox (filter #(<= (:at %) t)) (sort-by (juxt :at :peer)) vec)
+        remaining (vec (remove #(<= (:at %) t) inbox))]
+    (reduce (fn [s {:keys [peer input]}] (step-node s peer input))
+            (assoc sim :self-inbox remaining)
+            due)))
+
 (defn advance
   "Advance the simulation by one tick."
   [sim]
   (-> sim
       (update :tick inc)
+      deliver-self-inbox
       deliver-due-messages
       fire-due-timers
       complete-due-persists))

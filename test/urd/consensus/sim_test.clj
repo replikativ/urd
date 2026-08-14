@@ -158,6 +158,67 @@
           "and agreement? must report the violation"))))
 
 ;; ============================================================
+;; Self-delivery and persist-token correlation
+;; ============================================================
+
+(defrecord SelfTalker []
+  n/Node
+  (init [_ config]
+    (n/result {:peer-id (:peer-id config) :got [] :acks []}
+              ;; A self-addressed input placed BEHIND the durability barrier.
+              ;; This is etcd's trick: the leader learns its own append landed
+              ;; only once the write is durable.
+              [(n/persist-then {:writes {:hard :state}
+                                :epoch 7
+                                :token :my-write-1
+                                :then [(n/deliver-self {:type :self-ack :tag :after-fsync})]})
+               (n/deliver-self {:type :self-ack :tag :immediate})]))
+  (step [_ state input]
+    (case (:type input)
+      :self-ack (n/result (update state :got conj (:tag input)))
+      :persisted (n/result (update state :acks conj [(:token input) (:epoch input)]))
+      (n/result state))))
+
+(deftest self-delivery-works-and-survives-a-hostile-network
+  (testing "a node can address an input to itself; it is never dropped and
+            never partitioned, unlike [:send {:to self}]"
+    (let [s (sim/run (sim/make {:seed 1
+                                :nodes {:solo (->SelfTalker)}
+                                ;; Total loss and a partition of one: a network
+                                ;; send would have no chance of arriving.
+                                :config {:drop-rate 1.0}})
+                     20)
+          st (sim/node-state s :solo)]
+      (is (= #{:immediate :after-fsync} (set (:got st)))
+          "both self-deliveries arrived despite a 100% drop rate"))))
+
+(deftest persist-token-is-caller-supplied
+  (testing "the node names its own write, so it can correlate the completion.
+
+            Previously the interpreter minted the token, which forced any
+            algorithm with more than one write in flight to assume completions
+            arrive in issue order -- an ordering the protocol never promised."
+    (let [s (sim/run (sim/make {:seed 1 :nodes {:solo (->SelfTalker)}}) 20)
+          st (sim/node-state s :solo)]
+      (is (= [[:my-write-1 7]] (:acks st))
+          "the token and epoch came back exactly as supplied"))))
+
+(deftest self-delivery-does-not-recurse-within-a-step
+  (testing "delivery is queued to the next tick, so a node emitting a
+            self-delivery from its own handler cannot loop forever"
+    (let [looper (reify n/Node
+                   (init [_ c] (n/result {:peer-id (:peer-id c) :n 0}
+                                         [(n/deliver-self {:type :ping})]))
+                   (step [_ state input]
+                     (if (= :ping (:type input))
+                       ;; Emits another self-delivery every time it handles one.
+                       (n/result (update state :n inc) [(n/deliver-self {:type :ping})])
+                       (n/result state))))
+          s (sim/run (sim/make {:seed 1 :nodes {:solo looper}}) 10)]
+      ;; One per tick, not unbounded.
+      (is (= 10 (:n (sim/node-state s :solo)))))))
+
+;; ============================================================
 ;; Reproducibility -- the property the whole approach rests on
 ;; ============================================================
 
