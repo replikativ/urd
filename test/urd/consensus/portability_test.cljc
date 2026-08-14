@@ -20,6 +20,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [urd.consensus.algorithms.raft :as raft]
             [urd.consensus.algorithms.nakamoto :as nk]
+            [urd.consensus.algorithms.bullshark :as bs]
             [urd.consensus.bignat :as bn]
             [urd.consensus.proposer :as proposer]
             [urd.consensus.signing :as signing]
@@ -166,3 +167,117 @@
     (is (= 0x1b010132 (nk/retarget (nk/params {:pow-limit-bits 0x1d00ffff})
                                    0x1b0404cb 1000000 1000001))
         "a retarget clamped at the 1/4 bound")))
+
+;; ============================================================
+;; Bullshark: the total order itself
+;;
+;; This is the strongest cross-platform claim in the codebase, because it is
+;; the only one where a divergence would be a CONSENSUS FAILURE rather than a
+;; performance or scheduling difference: two nodes running the identical
+;; certified DAG would commit the identical vertices in a different sequence,
+;; each convinced it was correct, with no message lost and nothing to detect it
+;; on. Bullshark's ordering layer sends nothing, so there is no disagreement to
+;; observe -- only two divergent histories.
+;;
+;; Three things have to agree for the order to agree:
+;;
+;;   1. `hasch/uuid` over the header map -- the vertex identity;
+;;   2. the STRING comparison of digests, which fixes the DFS push order.
+;;      This is why digests are strings: the JVM's `UUID/compareTo` compares
+;;      the two 64-bit halves as SIGNED longs, ClojureScript's compares the
+;;      printed string, and those orders differ for any pair whose high bit
+;;      differs -- half of all pairs;
+;;   3. the STABILITY of `sort-by`, which preserves DFS order within a round
+;;      (TimSort on the JVM, `goog.array/stableSort` in ClojureScript).
+;;
+;; Only (1) would be caught by a digest fingerprint alone, which is why the
+;; whole committed sequence is pinned rather than a hash of one header.
+;; ============================================================
+
+(def ^:private bs-validators [:a :b :c :d])
+(def ^:private bs-uniform {:a 1 :b 1 :c 1 :d 1})
+
+(defn- bs-state []
+  (let [genesis (bs/genesis-certificates bs-validators)]
+    {:dag {0 genesis}
+     :last-committed (into {} (map (fn [v] [v 0])) bs-validators)
+     :last-committed-round 0
+     :certificates (into {} (map (fn [[_ c]] [(:id c) c])) genesis)
+     :slots {}
+     :gc-depth 50
+     :stake bs-uniform
+     :total-stake 4
+     :validators bs-validators
+     :anchor-fn bs/round-robin-anchor}))
+
+(defn- bs-dag
+  "A complete DAG of `n` rounds: every author names every certificate below."
+  [n]
+  (reduce (fn [st r]
+            (let [parents (into #{} (map :id) (vals (get-in st [:dag (dec r)])))]
+              (reduce (fn [s a]
+                        (let [c (bs/certificate {:author a :round r :payload [a r]
+                                                 :parents parents}
+                                                (set bs-validators))]
+                          (-> s
+                              (assoc-in [:dag r a] c)
+                              (assoc-in [:certificates (:id c)] c))))
+                      st bs-validators)))
+          (bs-state)
+          (range 1 (inc n))))
+
+(defn- bs-order [n]
+  (mapv (fn [c] [(:round (:header c)) (:author (:header c))])
+        (second (reduce (fn [[s acc] r]
+                          (let [[s' out] (bs/commit-sequence s r bs/anchor-for)]
+                            [s' (into acc out)]))
+                        [(bs-dag n) []]
+                        (range 0 (inc n))))))
+
+(deftest bullshark-digests-agree-across-platforms
+  (testing "content-addressed vertex identity, as strings"
+    (is (= "2a105f13-f6c8-5569-9e4d-16fb96f523f9"
+           (bs/header-id {:author :a :round 3 :payload {:x 1} :parents #{"p1" "p2"}})))
+    (is (= "175ad1a9-6b63-5098-8496-ccc286bc33bc"
+           (:id (bs/certificate {:author :a :round 3 :payload {:x 1}
+                                 :parents #{"p1" "p2"}}
+                                #{:a :b :c}))))
+    (is (= ["29966a27-531d-5851-97c0-2c90400af2a0"
+            "10dc3042-d601-550c-bed0-b83f57668772"
+            "1163405a-3ac1-54d0-846d-458bf1e3a5ed"
+            "3f773d04-8383-596a-a3eb-53d891f9ef88"]
+           (mapv #(:id (get (bs/genesis-certificates bs-validators) %)) bs-validators))
+        "the genesis set every node derives from the committee alone")))
+
+(deftest bullshark-total-order-agrees-across-platforms
+  (testing "the committed sequence of a seven-round DAG, vertex by vertex
+
+           Note the intra-round orders differ from round to round -- round 1 is
+           b,d,c,a and round 2 is c,b,a,d -- which is the DFS-then-stable-sort
+           at work. If this were author order or insertion order the assertion
+           would be vacuous."
+    (is (= [[1 :b] [1 :d] [1 :c] [1 :a]
+            [2 :c] [2 :b] [2 :a] [2 :d]
+            [3 :b] [3 :c] [3 :d] [3 :a]
+            [4 :a] [4 :b] [4 :c] [4 :d]
+            [5 :c] [5 :d] [5 :b] [5 :a]
+            [6 :c]]
+           (bs-order 7)))))
+
+(deftest bullshark-anchor-selection-agrees-across-platforms
+  (testing "a stake-weighted draw seeded by the round
+
+           An anchor rule that disagreed between a browser and the JVM would
+           split the network on the total order without a message being lost."
+    (is (= [:a :a :a :a :b :b :c :d :a :a :a :a]
+           (mapv #(bs/stake-weighted-anchor % bs-validators {:a 4 :b 2 :c 1 :d 1})
+                 (range 12))))
+    (is (= [:b :b :c :d :a :b :c :d :a :b :c :d]
+           (mapv #(bs/stake-weighted-anchor % bs-validators bs-uniform) (range 12))))))
+
+(deftest bullshark-thresholds-agree-across-platforms
+  (testing "integer division, and both are over total STAKE"
+    (is (= [1 2 3 3 4 5 5 6 7 7 27]
+           (mapv bs/quorum-threshold [1 2 3 4 5 6 7 8 9 10 40])))
+    (is (= [1 1 1 2 2 2 3 3 3 4 14]
+           (mapv bs/validity-threshold [1 2 3 4 5 6 7 8 9 10 40])))))
