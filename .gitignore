@@ -1,0 +1,18 @@
+# Clojure build artifacts
+.cpcache/
+.nrepl-port
+.lsp/
+.clj-kondo/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Testing
+.cljs_node_repl/
+out/
+target/
+
+# Internal docs and design work
+.internal/

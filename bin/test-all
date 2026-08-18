@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Every suite urd has. Run this BEFORE PUSHING -- not after every edit.
+#
+# This is the full gate and it costs minutes: `:test` alone is 650 tests,
+# `:integration` binds real sockets, and `:cljs-test` builds ClojureScript.
+# Each suite reports its own duration so it is obvious where the time goes.
+#
+# For iteration use an nREPL and run only the namespaces you touched --
+# seconds rather than minutes:
+#
+#   clj -M:test-repl                      # or your editor's REPL
+#   (require 'urd.consensus.foo-test :reload)
+#   (clojure.test/run-tests 'urd.consensus.foo-test)
+#
+# The ledger suites are gone from here: they moved to ../skuld along with the
+# code, and `clj -M:test` in that repository is their gate now. This script
+# used to invoke `:gas-test`, `:mvp-test` and `:ledger-test`, none of which are
+# aliases any more -- so on a machine with the sibling checkouts it would have
+# failed with "No function found" rather than running anything.
+#
+# The lesson from when they WERE here is worth keeping: when `start-runtime!`
+# began requiring `:auth`, the four-node ledger cluster test failed to start a
+# single node and stayed broken through a full session with `clj -M:test` green
+# throughout. A downstream consumer is a gate that the library's own suite is
+# not, which is now skuld's job to be.
+#
+# Suites run SEQUENTIALLY and deliberately. The integration tests assert
+# progress against a wall clock (>100 commits in five seconds), so anything
+# competing for the box makes them fail for reasons that have nothing to do
+# with the code.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+status=0
+run() {
+  local name=$1; shift
+  local t0=$(date +%s)
+  echo
+  echo "=== $name ==="
+  if "$@"; then
+    echo "--- $name: ok ($(( $(date +%s) - t0 ))s)"
+  else
+    echo "--- $name: FAILED ($(( $(date +%s) - t0 ))s)"
+    status=1
+  fi
+}
+
+run "unit + property (:test)"      clojure -M:test
+run "integration (:integration)"   clojure -M:integration
+run "clojurescript (:cljs-test)"   bash -c 'clojure -M:cljs-test && node target/cljs-test.js'
+
+# The machine-checked theorems, AND the differential check that the shipped
+# copies still match the verified definitions.
+#
+# That second half is the point. urd cannot CALL the ansatz-emitted functions --
+# ansatz is JVM-only and `urd.consensus.signing` is `.cljc` -- so what ships is a
+# hand-written copy of the emitted code. A copy is exactly the thing that gets
+# edited without its original, and until this ran in the gate the proofs said
+# nothing at all about the running code.
+#
+# No longer conditional: ansatz 0.2.84 carries the Boolean simp set, so this
+# runs against a released coordinate and is gated in CI too.
+run "machine-checked proofs (:proofs)" clojure -M:proofs
+
+if [ -d ../konserve ]; then
+  run "storage faults (:storage-sim)" clojure -M:storage-sim
+else
+  echo
+  echo "=== storage faults (:storage-sim) ==="
+  echo "--- SKIPPED: needs a konserve checkout at ../konserve"
+  echo "    (konserve.simulation.* is unreleased; see deps.edn)"
+  status=1
+fi
+
+echo
+if [ $status -eq 0 ]; then echo "ALL SUITES PASSED"; else echo "SOMETHING FAILED OR WAS SKIPPED"; fi
+exit $status

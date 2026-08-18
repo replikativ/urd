@@ -1,0 +1,151 @@
+version: 2.1
+
+# What CI runs: `:test` (650 tests, `^:integration` excluded), `:integration`
+# (real sockets), `:cljs-test` (built to a file, then run under node), and
+# `:format`.
+#
+# NOT here: `:storage-sim`, which needs a `../konserve` checkout because
+# `konserve.simulation.*` is unreleased. `bin/test-all` runs it and says so
+# loudly when it cannot.
+#
+# The ledger suites used to be excluded here for the same reason. They are now
+# in ../skuld, where they are that project's own gate rather than an
+# exclusion note in this one.
+
+orbs:
+  tools: replikativ/clj-tools@0
+
+workflows:
+  build-test-and-deploy:
+    jobs:
+      - tools/setup:
+          context: docker-deploy
+      - tools/build:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - tools/format:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - test-consensus:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - test-integration:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - test-proofs:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - test-cljs:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - tools/deploy:
+          context:
+            - clojars-deploy
+            - docker-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - tools/build
+            - test-consensus
+            - test-integration
+            - test-cljs
+      - tools/release:
+          context:
+            - github-token
+            - docker-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - tools/deploy
+
+jobs:
+  test-consensus:
+    docker:
+      - image: cimg/clojure:1.12
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - run:
+          name: Download dependencies
+          command: clojure -P -M:test
+      - run:
+          name: Run consensus tests
+          command: clojure -M:test
+
+  # The machine-checked theorems, AND the differential check that the shipped
+  # copies still match the verified definitions.
+  #
+  # The second half is why this is gated rather than a nicety. urd cannot CALL
+  # the ansatz-emitted functions -- ansatz is JVM-only and `urd.consensus.signing`
+  # is `.cljc` -- so what ships is a hand-written copy. A copy is what gets
+  # edited without its original, and until this job existed nothing checked the
+  # correspondence.
+  #
+  # Runnable in CI only since ansatz 0.2.84, which carries the Boolean simp set
+  # (replikativ/ansatz#70). Before that every theorem failed with
+  # `grind: all strategies failed` on the released version.
+  test-proofs:
+    docker:
+      - image: cimg/clojure:1.12
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - run:
+          name: Download dependencies
+          command: clojure -P -M:proofs
+      - run:
+          name: Check the proofs and the shipped copies
+          command: clojure -M:proofs
+
+  # The real-network tests: four validators over actual websockets. Separate
+  # from `test-consensus` because they are slower and because they compete for
+  # ports and CPU -- `commits-reach-the-application-in-order` asserts >100
+  # commits in five wall-clock seconds and fails under contention while
+  # clearing the bar several times over when it has the box to itself.
+  test-integration:
+    docker:
+      - image: cimg/clojure:1.12
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - run:
+          name: Download dependencies
+          command: clojure -P -M:integration
+      - run:
+          name: Run integration tests
+          command: clojure -M:integration
+
+  # The portability claim, exercised. urd says it is a clj+cljs library, and
+  # that claim was false and untested for as long as the simulator existed:
+  # ClojureScript's `bit-and` yields a signed 32-bit integer, so the seeded
+  # PRNG produced different sequences on the two platforms and therefore
+  # different delays, drops and sampled peers. It survived because every test
+  # that could have caught it was `.clj`.
+  test-cljs:
+    docker:
+      - image: cimg/clojure:1.12-node
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - run:
+          name: Download dependencies
+          command: clojure -P -M:cljs-test
+      - run:
+          name: Build the portable tests for Node
+          command: clojure -M:cljs-test
+      - run:
+          # The alias COMPILES; it does not run anything. Without this second
+          # step the job was green in a few seconds having executed no test at
+          # all, which is exactly the failure the alias comment warns about:
+          # "a portability claim that no CI job exercises is not a claim, it is
+          # a comment." `bin/test-all` always did both; CI did not.
+          name: Run portable tests under Node
+          command: node target/cljs-test.js

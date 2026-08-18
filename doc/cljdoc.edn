@@ -1,0 +1,14 @@
+{:cljdoc.doc/tree
+ [["Readme"            {:file "README.md"}]
+  ["Getting started" {}
+   ["The Node protocol" {:file "doc/node-protocol.md"}]
+   ["Algorithms"        {:file "doc/algorithms.md"}]
+   ["The simulator"     {:file "doc/simulator.md"}]]
+  ["Running a node" {}
+   ["The runtime"       {:file "doc/runtime.md"}]
+   ["Security"          {:file "doc/security.md"}]
+   ["Validator sets"    {:file "doc/validator-sets.md"}]]
+  ["Reference" {}
+   ["Wire format"       {:file "doc/wire-format.md"}]
+   ["Portability"       {:file "doc/portability.md"}]
+   ["Interop"           {:file "doc/interop/README.md"}]]]}
