@@ -16,3 +16,6 @@ target/
 
 # Internal docs and design work
 .internal/
+
+# Agent scratch state: worktrees and session files, never part of the library.
+.claude/
