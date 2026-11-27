@@ -312,6 +312,9 @@
   [st]
   [{:writes {:log-base (:log-base st 0)
              :base-term (:base-term st 0)
+             :membership {:index (:commit st)
+                          :validators (:validators st)
+                          :outgoing (vec (:outgoing st))}
              :entries (vec (:log st))}
     :durable? true}
    {:writes {:hard-state {:term (:term st) :vote (:vote st) :commit (:commit st)}}
@@ -525,6 +528,9 @@
   {:validators (:validators st)
    :powers (zipmap (:validators st) (repeat 1))})
 
+(defn- voters [st]
+  (distinct (concat (:validators st) (:outgoing st))))
+
 (defn- activate-config
   "Apply the set change in `e`, if it has one and it is valid.
 
@@ -558,7 +564,8 @@
     ;; the new set is already installed, this only drops the old half.
     (:leave-joint (:data e))
     (-> st
-        (assoc :outgoing [])
+        (assoc :outgoing [] :progress (select-keys (:progress st) (:validators st)))
+        (assoc-in [:fx :membership-changed?] true)
         (update-in [:fx :logs] conj
                    (node/log-effect :info {:event :left-joint-config
                                            :at (:index e)
@@ -600,6 +607,7 @@
               ;; would be state nothing consults -- and state nothing consults
               ;; is state that silently goes stale.
               (assoc :validators vs)
+              (assoc-in [:fx :membership-changed?] true)
               (cond-> joint? (assoc :outgoing (:validators st)))
               ;; Progress for anyone new, and no Progress for anyone gone.
               ;; A stale entry for a removed peer would keep contributing its
@@ -614,7 +622,7 @@
                            (into {} (map (fn [p]
                                            [p (or (get-in st [:progress p])
                                                   (new-progress (inc li)))]))
-                                 (distinct (concat vs (:outgoing st' []))))))
+                                 (voters st'))))
               (update-in [:fx :logs] conj
                          (node/log-effect
                           :info {:event :validator-set-changed
@@ -654,10 +662,13 @@
   urd's `unstable.offset-1`; it was maintained in three places and read in none,
   so the gate was computed and never installed. This is that gate."
   [st]
-  (let [applied (:applied st)
-        ;; The commit index says the cluster agreed; :stable says our own write
+  (let [;; The commit index says the cluster agreed; :stable says our own write
         ;; landed. Applying needs both.
-        deliverable (min (:commit st) (:stable st 0))]
+        deliverable (min (:commit st) (:stable st 0))
+        reported (:delivered-through st 0)
+        applied (max (:applied st) (min reported deliverable))
+        st (cond-> (assoc st :applied applied)
+             (>= deliverable reported) (dissoc :delivered-through))]
     (if (<= deliverable applied)
       st
       (let [ents (subvec (:log st) (log-pos st (inc applied)) (log-pos st (inc deliverable)))]
@@ -717,7 +728,7 @@
 
 (defn- bcast-append [st]
   (reduce (fn [s to] (if (= to (:id s)) s (send-append s to)))
-          st (:validators st)))
+          st (voters st)))
 
 (defn- send-heartbeat [st to]
   (let [pr (get-in st [:progress to])
@@ -728,7 +739,7 @@
 
 (defn- bcast-heartbeat [st]
   (reduce (fn [s to] (if (= to (:id s)) s (send-heartbeat s to)))
-          st (:validators st)))
+          st (voters st)))
 
 ;; ============================================================
 ;; Role transitions
@@ -748,7 +759,7 @@
                :progress (into {} (map (fn [p]
                                          [p (cond-> (new-progress (inc li))
                                               (= p (:id st)) (assoc :match li))]))
-                               (:validators st))))))
+                               (voters st))))))
 
 (defn- become-follower [st term lead]
   (-> st
@@ -872,14 +883,14 @@
                                   :index (last-index s)
                                   :log-term (last-term s)}))))
             st
-            (:validators st))))
+            (voters st))))
 
 (defn- hup [st]
   (cond
     (= :leader (:role st))
     (log-line st :debug (str (:id st) " ignoring election tick because already leader"))
 
-    (not (contains? (set (:validators st)) (:id st)))
+    (not (contains? (set (voters st)) (:id st)))
     (log-line st :warn (str (:id st) " is not a voter and cannot campaign"))
 
     :else
@@ -1318,7 +1329,9 @@
               ;; entries to the platter, and advancing on one made
               ;; `flush-commits`' gate a leak rather than a delay -- it handed
               ;; the application entries this node had not durably stored.
-              (cond-> (:durable? w) (update :stable max (:last-index w)))
+              (cond-> (:durable? w) (update :stable max (:last-index w))
+                      (= token (:last-durable-token st)) (dissoc :last-durable-token)
+                      (seq (:replies w)) (update-in [:fx :msgs] into (:replies w)))
               (consume-self-ack token)
               (consume-self-vote token)
               ;; Durability just advanced, so entries that were committed but
@@ -1333,21 +1346,31 @@
   "Turn the accumulated :fx into the effect vector, wrapping the gated messages
   in the durability barrier."
   [st]
-  (let [{:keys [msgs after logs commits truncate-from appended? hs0]} (:fx st)
+  (let [st (if (and (= :leader (:role st))
+                    (get-in st [:fx :membership-changed?])
+                    (not (contains? (:progress st) (:id st))))
+             (become-follower st (:term st) nil)
+             st)
+        {:keys [msgs after logs commits truncate-from appended? hs0]} (:fx st)
         hs {:term (:term st) :vote (:vote st) :commit (:commit st)}
         hs-changed? (not= hs hs0)
         li (last-index st)
         new-ents (if (< (:issued st) li)
                    (vec (subvec (:log st) (log-pos st (inc (:issued st)))))
                    [])
-        arm-self? (or (:self-ack st) (:self-vote st))
+        arm-self? (some #(and % (nil? (:token %))) [(:self-ack st) (:self-vote st)])
         cp? (boolean (:checkpoint-due? st))
-        need? (or appended? hs-changed? (seq after) truncate-from arm-self? cp?)
         ;; MustSync (rawnode.go:191-198): entries, vote, or term. A commit-index
         ;; change alone is recoverable by replaying the log, so it is buffered.
-        sync? (boolean (or (seq new-ents) truncate-from cp?
+        sync? (boolean (or (seq new-ents) truncate-from cp? (get-in st [:fx :membership-changed?])
                            (not= (:term hs) (:term hs0))
                            (not= (:vote hs) (:vote hs0))))
+        ;; A repeated append or vote can depend on a preceding fsync while
+        ;; carrying no new data itself. Attach its reply to that exact write.
+        fence (when (and (seq after) (not sync?)) (:last-durable-token st))
+        st (cond-> st fence (update-in [:pending-writes fence :replies] (fnil into []) after))
+        after (if fence [] after)
+        need? (or appended? hs-changed? (seq after) truncate-from arm-self? cp?)
         ;; The checkpoint REPLACES this step's ordinary write rather than
         ;; accompanying it. `checkpoint-records` already carries the retained
         ;; entries and the hard state, so a second write would say the same
@@ -1382,6 +1405,7 @@
                    (assoc-in [:self-ack :token] token)
                    (and (:self-vote st) (nil? (:token (:self-vote st))))
                    (assoc-in [:self-vote :token] token))
+                 (cond-> sync? (assoc :last-durable-token token))
                  (assoc :next-write-token (inc token)))
              st)
         effects (vec (concat logs
@@ -1432,6 +1456,7 @@
                   acc (if (contains? writes :log-base)
                         (assoc acc :log-base (:log-base writes)
                                :base-term (:base-term writes 0)
+                               :membership (:membership writes)
                                :log [])
                         acc)
                   acc (if truncate-from
@@ -1440,7 +1465,7 @@
                   acc (if-let [hs (:hard-state writes)]
                         (assoc acc :hard-state hs)
                         acc)]
-              (if-let [es (:entries writes)]
+              (if-let [es (seq (:entries writes))]
                 (update acc :log
                         (fn [l]
                           ;; Entries carry their own index, so an append that
@@ -1490,7 +1515,7 @@
           ;; the equivalent of etcd's bootstrap snapshot. Replay starts there,
           ;; not from an empty log, or a restart would forget everything the
           ;; node was created with.
-          {:keys [log hard-state log-base base-term]}
+          {:keys [log hard-state log-base base-term membership]}
           (replay {:log (vec (:initial-log cfg))
                    :log-base 0
                    :base-term 0
@@ -1524,8 +1549,27 @@
           ;; whole prefix instead.
           delivered (:delivered-through cfg)
           applied (if (number? delivered) (min commit (max 0 delivered)) commit)
+          ;; A legacy compacted WAL no longer contains the entries needed to
+          ;; reconstruct voters. Its operator may supply the authoritative
+          ;; configuration at the compacted boundary.
+          membership (or membership (when (pos? log-base) (:restored-membership cfg))
+                         (when (zero? log-base)
+                           {:index 0 :validators (node/validator-set cfg) :outgoing []}))
+          _ (when-not (and (seq (:validators membership))
+                           (integer? (:index membership))
+                           (<= log-base (:index membership) commit))
+              (throw (ex-info "Raft recovery requires the committed voter configuration"
+                              {:event :membership-snapshot-required :log-base log-base
+                               :commit commit})))
+          _ (when (< applied log-base)
+              (throw (ex-info "Raft consumer requires a snapshot of the compacted prefix"
+                              {:event :consumer-behind-retention :delivered applied
+                               :commit commit :oldest-held (inc log-base)})))
           st {:id (:peer-id cfg)
-              :validators (node/validator-set cfg)
+              :validators (node/validator-set {:validators (:validators membership)})
+              :outgoing (if (seq (:outgoing membership))
+                          (node/validator-set {:validators (:outgoing membership)})
+                          [])
               :role :follower
               :term (or (:term hard-state) 0)
               :vote (:vote hard-state)
@@ -1556,7 +1600,10 @@
               :pre-vote? (:pre-vote? cfg)
               :log-retention (:log-retention cfg)
               :election-draw 0}
-          st (fresh-fx st)
+          st (cond-> (fresh-fx st)
+               (and (number? delivered) (> delivered commit)) (assoc :delivered-through delivered))
+          st (reduce activate-config st
+                     (subvec (:log st) (- (:index membership) log-base) (- commit log-base)))
           st (-> st
                  (reset-state (:term st))
                  (assoc :role :follower)
@@ -1565,89 +1612,16 @@
                                       ", lastindex: " li ", lastterm: "
                                       (or (term-at st li) 0) "]"))
                  arm-election-timer
-                 ;; Announce the committed prefix we can prove from disk.
-                 ;;
-                 ;; `:applied` starts at `commit`, so without this an entry that
-                 ;; was committed but NOT yet delivered is never delivered at
-                 ;; all. That state is one this implementation deliberately
-                 ;; creates: `flush-commits` holds delivery behind `:stable`, so
-                 ;; a follower routinely has `commit=2, applied=0` with zero
-                 ;; `:commit` effects emitted -- and for a follower the entries
-                 ;; and the commit index arrive in the SAME message, so every
-                 ;; crash with entries in flight lands in that window. The
-                 ;; restarted node would then hold entries it had silently
-                 ;; never handed over, diverging from every peer with nothing to
-                 ;; re-check it.
-                 ;;
-                 ;; `resync` rather than `commit`, and that distinction is the
-                 ;; whole reason the two effects were split. This is not a
-                 ;; revocation and not an extension of the prefix: it is a
-                 ;; restarting node telling the interpreter what it now believes
-                 ;; its committed prefix to be, which is `resync`'s stated
-                 ;; purpose. Re-emitting it as `commit` would APPEND a second
-                 ;; copy of the prefix -- measured: `sim/agreement?` fails,
-                 ;; because the restarted node's committed sequence no longer
-                 ;; matches its peers'.
-                 ;;
-                 ;; etcd instead takes `Config.Applied` from the application and
-                 ;; warns that, unset, "raft might return previous applied
-                 ;; entries" (`raft.go:147-151`) -- it errs toward re-delivery
-                 ;; and pushes idempotence onto the consumer. We can do better
-                 ;; because our protocol has an effect that says exactly this.
-                 ;; Announced whenever we RESTARTED, even if the prefix is
-                 ;; empty. The guard used to be `(pos? commit)`, which is wrong
-                 ;; in exactly the case that matters: the commit-index rides in
-                 ;; the hard state, so a crash that loses the last write batch
-                 ;; brings us back with `commit` 0 -- and then we announced
-                 ;; nothing and re-delivered the prefix as fresh commits.
-                 ;;
-                 ;; Measured: a leader crashed with a write in flight came back
-                 ;; and delivered entry 1 a second time, so its committed
-                 ;; sequence read [e1 e1 e2] against its peers' [e1 e2 e3] and
-                 ;; `sim/agreement?` failed. "I have nothing" is a statement
-                 ;; about the prefix and has to be made, not omitted.
-                 ;; ...but ONLY when the consumer has not said where it is,
-                 ;; and only from an uncompacted log.
-                 ;;
-                 ;; `resync` replaces the consumer's view WHOLESALE, which is
-                 ;; the right shape for a node that must GUESS. After
-                 ;; compaction this node no longer holds its full committed
-                 ;; prefix -- that is the point of compaction -- so announcing
-                 ;; what it does hold would tell a ledger to drop every
-                 ;; committed transaction below the boundary: data loss on the
-                 ;; recovery path, caused by a successful optimisation.
-                 ;;
-                 ;; Suppressing it made that safe and opened a smaller hole in
-                 ;; its place. `resync` exists because an entry committed but
-                 ;; not yet DELIVERED would otherwise never be handed over, and
-                 ;; suppressing it for compacted nodes disabled that fix for
-                 ;; exactly those nodes.
-                 ;;
-                 ;; `:delivered-through` closes both. When the consumer says
-                 ;; where it is there is nothing to guess: `applied` starts
-                 ;; there and the gap goes out as ORDINARY commits, which
-                 ;; append rather than replace and so cannot truncate anything.
-                 ;; Compaction is irrelevant to it, because retention is
-                 ;; measured from `applied` and the undelivered window is above
-                 ;; `applied` by definition -- unless the consumer is further
-                 ;; behind than retention, which is the one case we cannot
-                 ;; serve and therefore say so.
+                 ;; A known consumer position lets us append only its missing
+                 ;; suffix. With no position, only a complete, uncompacted
+                 ;; log may replace the consumer's view.
                  (cond->
-                  (and (number? delivered) (< applied commit)
-                       (> (inc applied) log-base))
-                   (update-in [:fx :commits] conj
-                              (node/commit (vec (subvec (vec log)
-                                                        (log-pos st (inc applied))
-                                                        (log-pos st (inc commit))))))
-
-                   (and (number? delivered) (< applied commit)
-                        (<= (inc applied) log-base))
-                   (update-in [:fx :logs] conj
-                              (node/log-effect
-                               :warn
-                               {:event :consumer-behind-retention
-                                :delivered applied :commit commit
-                                :oldest-held (inc log-base)}))
+                  (and (number? delivered) (< applied commit))
+                   (-> (assoc :applied commit)
+                       (update-in [:fx :commits] conj
+                                  (node/commit (subvec (:log st)
+                                                       (log-pos st (inc applied))
+                                                       (log-pos st (inc commit))))))
 
                    (and (not (number? delivered))
                         (seq (:writes restored)) (zero? log-base))
@@ -1758,6 +1732,10 @@
 
 (defn make
   "A Raft node. Per-node configuration is supplied through the simulator's
-  `:node-config`, or merged into `init`'s config by a runtime."
+  `:node-config`, or merged into `init`'s config by a runtime.
+
+  Legacy compacted logs without a voter snapshot require `:restored-membership`
+  with the authoritative `:index`, `:validators` and `:outgoing` at that index.
+  The index must lie between the compacted boundary and the durable commit."
   []
   (->Raft))

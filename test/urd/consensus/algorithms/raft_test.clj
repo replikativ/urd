@@ -880,7 +880,13 @@
         (let [{st :state fx :effects} (init-with 12)
               commits (filter #(= :commit (node/effect-kind %)) fx)
               handed (mapcat #(:vertices (node/effect-params %)) commits)]
-          (is (= 12 (:applied st)) "we resume from where the consumer is")
+          (is (= 20 (:applied st)) "the catch-up batch advances the delivery cursor")
+          (is (empty? (filter #(= :commit (node/effect-kind %))
+                              (:effects (node/step (raft/make) st
+                                                   (node/message-received
+                                                    :b {:type :heartbeat :term 1 :commit 20}
+                                                    #{:b})))))
+              "the next heartbeat does not deliver the catch-up batch again")
           (is (= (range 13 21) (map :index handed))
               "the gap and nothing else -- no re-delivery, no omission")
           (is (empty? (filter #(= :resync (node/effect-kind %)) fx))
@@ -937,16 +943,13 @@
                     :log (vec (for [i (range 1 201)] {:index i :term 2 :data i}))
                     :applied 150 :commit 150 :term 2)
           records (raft/checkpoint-records (raft/compact st 10))
-          {fx :effects}
-          (node/init (raft/make) {:peer-id :a :validators [:a :b :c]
-                                  :restored {:durable {} :writes records}
-                                  :delivered-through 3})
-          logs (filter #(= :log (node/effect-kind %)) fx)]
-      (is (empty? (filter #(#{:commit :resync} (node/effect-kind %)) fx))
-          "nothing is handed over, because nothing contiguous can be")
-      (is (some #(= :consumer-behind-retention (:event (:message (node/effect-params %))))
-                logs)
-          (str "and it is reported: " (mapv #(node/effect-params %) logs))))))
+          err (try
+                (node/init (raft/make) {:peer-id :a :validators [:a :b :c]
+                                        :restored {:writes records}
+                                        :delivered-through 3})
+                (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= {:event :consumer-behind-retention :delivered 3
+              :commit 150 :oldest-held 141} err)))))
 
 ;; ============================================================
 ;; Membership changes
@@ -1129,3 +1132,77 @@
         "an empty outgoing half is neutral by construction -- which is why
          there is one code path rather than a branch that could disagree with
          itself")))
+
+(deftest retransmitted-promises-wait-for-the-original-fsync
+  (let [impl (raft/make)
+        cfg {:peer-id :b :validators [:a :b :c]}
+        effects-of (fn [kind r] (filter #(= kind (node/effect-kind %)) (:effects r)))]
+    (doseq [msg [{:type :app :term 1 :prev-index 0 :prev-term 0 :commit 0
+                  :entries [{:index 1 :term 1 :data :one}]}
+                 {:type :vote :term 1 :index 0 :log-term 0}]]
+      (let [input (node/message-received :a msg #{:a})
+            first-reply (node/step impl (:state (node/init impl cfg)) input)
+            write (node/effect-params (first (effects-of :persist-then first-reply)))
+            repeated (node/step impl (:state first-reply) input)
+            landed (node/step impl (:state repeated) (node/persisted (:token write) 1))]
+        (is (:durable? write))
+        (is (= 1 (count (:then write))))
+        (is (empty? (effects-of :send repeated)))
+        (is (empty? (effects-of :persist-then repeated)))
+        (is (= (:then write) (vec (effects-of :send landed))))))))
+
+(deftest joint-voters-survive-recovery-and-participate-in-protocol-traffic
+  (let [impl (raft/make)
+        old [:a :b :c]
+        cfg {:peer-id :b :validators old}
+        enter {:index 1 :term 3
+               :data {:validator-updates [{:id :b :power 0} {:id :c :power 0}
+                                          {:id :d :power 1} {:id :e :power 1}]}}
+        leave {:index 2 :term 3 :data {:leave-joint true}}
+        records [{:writes {:entries [enter] :hard-state {:term 3 :commit 1}}}]
+        restore (fn [writes] (:state (node/init impl (assoc cfg :restored {:writes writes}))))
+        joint (restore records)
+        checkpoint (raft/checkpoint-records (raft/compact joint 0))
+        recipients (fn [r]
+                     (set (for [fx (:effects r) :when (= :send (node/effect-kind fx))]
+                            (:to (node/effect-params fx)))))]
+    (doseq [st [joint (restore checkpoint)]]
+      (is (= [:a :d :e] (:validators st)))
+      (is (= old (:outgoing st)))
+      (is (= #{:a :b :c :d :e} (set (keys (:progress st)))))
+      (is (= #{:a :c :d :e} (recipients (node/step impl st (node/timer-fired :election)))))
+      (let [leader (assoc st :role :leader)]
+        (is (= #{:a :c :d :e} (recipients (node/step impl leader (node/timer-fired :heartbeat)))))
+        (is (= #{:a :c :d :e} (recipients (node/step impl leader (node/value-ready :v)))))))
+    (let [left (restore (conj checkpoint {:writes {:entries [leave]
+                                                   :hard-state {:term 3 :commit 2}}}))]
+      (is (= [:a :d :e] (:validators left)))
+      (is (empty? (:outgoing left)))
+      (is (= #{:a :d :e} (set (keys (:progress left)))))
+      (is (empty? (recipients (node/step impl left (node/timer-fired :election))))))))
+
+(deftest recovering-when-the-consumer-is-ahead-of-the-hard-state
+  (let [impl (raft/make)
+        writes [{:writes {:entries (entries [1 1 1 1]) :hard-state {:term 1 :commit 1}}}]
+        st (:state (node/init impl {:peer-id :a :validators [:a :b :c]
+                                    :restored {:writes writes} :delivered-through 3}))
+        heartbeat (fn [st c] (node/step impl st (node/message-received
+                                                 :b {:type :heartbeat :term 1 :commit c} #{:b})))
+        partial (heartbeat st 2)
+        caught-up (heartbeat (:state partial) 4)
+        delivered (fn [r] (mapcat #(map :index (:vertices (node/effect-params %)))
+                                  (filter #(= :commit (node/effect-kind %)) (:effects r))))]
+    (is (empty? (delivered partial)))
+    (is (= [4] (delivered caught-up)))))
+
+(deftest legacy-compaction-requires-authoritative-membership
+  (let [impl (raft/make)
+        cfg {:peer-id :a :validators [:a :b]
+             :restored {:writes [{:writes {:log-base 7 :base-term 1 :entries []}}
+                                 {:writes {:hard-state {:term 1 :commit 7}}}]}}]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"committed voter configuration"
+                          (node/init impl cfg)))
+    (let [st (:state (node/init impl (assoc cfg :restored-membership
+                                            {:index 7 :validators [:a :c] :outgoing [:a :b]})))]
+      (is (= [:a :c] (:validators st)))
+      (is (= [:a :b] (:outgoing st))))))
