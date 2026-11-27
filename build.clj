@@ -1,6 +1,7 @@
 (ns build
   "Build and publish Urd to Clojars."
-  (:require [clojure.tools.build.api :as b]
+  (:require [borkdude.gh-release-artifact :as gh]
+            [clojure.tools.build.api :as b]
             [deps-deploy.deps-deploy :as dd]))
 
 (def lib 'org.replikativ/urd)
@@ -49,6 +50,15 @@
               :artifact (jar-file)
               :pom-file (b/pom-path {:lib lib :class-dir class-dir})})
   (println "Deployed to Clojars!"))
+
+(defn release [_]
+  (gh/overwrite-asset {:org "replikativ"
+                       :repo (name lib)
+                       :tag (version)
+                       :commit (b/git-process {:git-args "rev-parse HEAD"})
+                       :file (jar-file)
+                       :content-type "application/java-archive"
+                       :draft false}))
 
 (defn install [_]
   (jar nil)

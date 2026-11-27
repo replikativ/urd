@@ -55,7 +55,7 @@ real one.
 ## Installation
 
 ```clojure
-org.replikativ/urd {:mvn/version "0.1.19"}
+org.replikativ/urd {:mvn/version "0.1.20"}
 ```
 
 ## Quick start
