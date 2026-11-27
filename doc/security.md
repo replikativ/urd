@@ -188,7 +188,7 @@ build.
 in the `:proofs` alias; the published pom does not mention it, and a consumer of
 `org.replikativ/urd` never loads it.
 
-Needs ansatz 0.2.84 or later for the Boolean simp set.
+The proof alias pins Ansatz 0.2.654. The quorum theorem uses the omega arithmetic tactic.
 
 ## Application agreement
 

@@ -26,9 +26,7 @@
      `commit` behind `persist-then` -- Tendermint, Bullshark, SCP -- is relying
      on this sentence being true.
 
-  Not in CI: `konserve.simulation.*` is not in a released konserve (checked
-  against 0.9.372), so this needs `{:local/root \"../konserve\"}`, exactly as
-  the datahike ledger does. `bin/test-all` runs it."
+  Run with clojure -M:storage-sim, including in the release workflow."
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.core.async :refer [<!!]]
             [konserve.simulation.crash :as crash]

@@ -99,6 +99,7 @@
             [clojure.string :as str]
             [urd.consensus.node :as node]
             [urd.consensus.rng :as rng]
+            [urd.wire :as wire]
             [hasch.core :as hasch]))
 
 ;; ============================================================
@@ -678,6 +679,8 @@
   {:nomination-timeout 4   ; ticks per nomination round, times the round number
    :ballot-timeout 4       ; ticks per ballot counter, times the counter
    :timeout-cap 8          ; stellar-core caps the linear growth; so do we
+   :qset-reply-limit 64
+   :qset-reply-bytes 1048576
    :gossip-interval 12})   ; re-broadcast, so a lost statement is not fatal
 
 (defn- ballot-statements
@@ -767,7 +770,10 @@
   in which case a second hash. Weighting the lottery by trust is what makes a
   widely-trusted node likely to lead."
   [st n]
-  (let [[num den] (or (node-weight-fraction n (:qset st)) [0 1])]
+  ;; Self belongs to the nomination lottery even when our explicit trust
+  ;; expression lists only other validators. Preserve explicit weights.
+  (let [[num den] (or (node-weight-fraction n (:qset st))
+                      (if (= n (:id st)) [1 1] [0 1]))]
     (if (< (* (hash-node st false n) den) (* 4294967296 num))
       (hash-node st true n)
       0)))
@@ -780,7 +786,7 @@
   leader set a partitioned leader stalls nomination forever, whereas a growing
   one eventually contains a node everybody can hear."
   [st]
-  (let [nodes (sort-by pr-str (qset-nodes (:qset st)))
+  (let [nodes (sort-by pr-str (conj (qset-nodes (:qset st)) (:id st)))
         prios (mapv (fn [n] [n (node-priority st n)]) nodes)
         top (reduce max 0 (map second prios))]
     (if (pos? top)
@@ -1341,8 +1347,9 @@
   (`:1473`), and `HerderImpl::persistSCPState` (`HerderImpl.cpp:865`) runs
   before the broadcast at `:867`.
 
-  When nothing needs writing, `gated` is emitted directly: no write means no
-  change to gate on, so the state justifying it is already durable."
+  A gossip tick replays only a current statement whose own persistence token
+  completed (or whose envelope was read from disk). A local commit always
+  travels with the write that records its supporting state."
   [st gated]
   (let [nom (:own-nomination st)
         bal (:own-ballot st)
@@ -1352,21 +1359,27 @@
         bal-new? (and bal (:emitted? bal) (not= bal (:sent-ballot st)))
         msgs (cond-> []
                nom-new? (conj (node/broadcast :scp nom))
-               bal-new? (conj (node/broadcast :scp bal)))]
-    (if (empty? msgs)
-      [st (vec gated)]
-      [(assoc st
-              :sent-nomination (if nom-new? nom (:sent-nomination st))
-              :sent-ballot (if bal-new? bal (:sent-ballot st))
-              :write-seq (inc (:write-seq st)))
-       [(node/persist-then {:writes {:scp (select-keys st [:slot :phase :b :p :pp :h :c
-                                                           :nom-votes :nom-accepted
-                                                           :nom-candidates :composite
-                                                           :prev-value :value])}
-                            :durable? true
-                            :epoch (:slot st)
-                            :token [:scp (:write-seq st)]
-                            :then (vec (concat msgs gated))})]])))
+               bal-new? (conj (node/broadcast :scp bal)))
+        ;; Each statement has its own barrier. A pending ballot must not
+        ;; block replay of a durable nomination, or escape with it.
+        replay (cond-> []
+                 (and (:gossip? st) nom (= nom (:durable-nomination st)))
+                 (conj (node/broadcast :scp nom))
+                 (and (:gossip? st) bal (= bal (:durable-ballot st)))
+                 (conj (node/broadcast :scp bal)))
+        st (dissoc st :gossip?)]
+    (if (and (empty? msgs) (empty? gated))
+      [st replay]
+      (let [token [:scp (:write-seq st)]
+            st (cond-> (update st :write-seq inc)
+                 nom-new? (assoc :sent-nomination nom :nomination-token token)
+                 bal-new? (assoc :sent-ballot bal :ballot-token token))
+            saved (select-keys st [:slot :phase :b :p :pp :h :c :nom-votes :nom-accepted
+                                   :nom-candidates :composite :prev-value :value
+                                   :sent-nomination :sent-ballot])]
+        [st (conj replay (node/persist-then {:writes {:scp saved}
+                                             :durable? true :epoch (:slot st) :token token
+                                             :then (into msgs gated)}))]))))
 
 (defn- fetch-effects
   "Ask for quorum sets we cannot resolve.
@@ -1446,20 +1459,20 @@
 
 (defn- handle-message [st from msg]
   (case (:kind msg)
-    ;; Served only to a node in our own slices.
-    ;;
-    ;; This answered anyone, from a cache anyone could fill, and the reply is a
-    ;; `send-to` -- which the runtime emulates as a BROADCAST. So a ~50-byte
-    ;; request made us put a quorum set of up to `max-qset-nodes` entries on the
-    ;; wire to every peer, unthrottled and repeatable: an amplifier of roughly
-    ;; 600n. A peer outside our slices has no use for our preimages; it cannot
-    ;; be part of any fixpoint we evaluate.
-    :get-qset (if-not (contains? (qset-nodes (:qset st)) from)
-                st
-                (if-let [q (get (:known-qsets st) (:hash msg))]
-                  (update st :replies (fnil conj [])
-                          (node/send-to from {:kind :qset :hash (:hash msg) :qset q}))
-                  st))
+    ;; Trust is directional. Serve our own advertised preimage to an
+    ;; authenticated requester, once per peer and within a shared budget.
+    :get-qset
+    (let [size (:qset-response-size st)
+          served (:qset-served st)]
+      (if (and (= (:hash msg) (:qset-hash st))
+               (not (contains? served from))
+               (< (count served) (:qset-reply-limit st))
+               (<= (* (inc (count served)) size) (:qset-reply-bytes st)))
+        (-> st
+            (update :qset-served conj from)
+            (update :replies (fnil conj [])
+                    (node/send-to from {:kind :qset :hash (:qset-hash st) :qset (:qset st)})))
+        st))
 
     ;; Only a qset we ASKED for.
     ;;
@@ -1520,17 +1533,6 @@
                                     true)))]
       (cond-> st (decided-true? r) (assoc :heard-from-quorum? true)))))
 
-(defn- gossip-resend
-  "On the gossip tick, forget what we last sent so it is re-broadcast, and drop
-  outstanding fetch requests so they are re-issued.
-
-  Tendermint's report named the absence of in-machine retransmission as the
-  reason 30% message loss produced zero progress. SCP needs it more, not less:
-  its statements are cumulative state rather than a vote in a round, so a lost
-  one is never resent by any other mechanism."
-  [st]
-  (assoc st :sent-nomination nil :sent-ballot nil :requested #{}))
-
 (defn- transition [st input]
   (let [st (assoc st :replies [])
         st (case (:type input)
@@ -1544,11 +1546,15 @@
                                  (handle-message st (:from input) (:msg input))
                                  st)
              :timer-fired (let [st (handle-timer st (:timer-id input))]
-                            (cond-> st (= :gossip (:timer-id input)) gossip-resend))
+                            (cond-> st (= :gossip (:timer-id input))
+                                    (assoc :gossip? true :requested #{} :qset-served #{})))
              :value-ready (-> st (assoc :value (:value input)) (nominate false))
-             ;; `persisted` needs no handling: the write's only purpose is that
-             ;; a restart can read it, and the broadcast it gates is carried in
-             ;; the effect's `:then`.
+             :persisted (let [token (:token input)]
+                          (cond-> st
+                            (and (= (:epoch input) (:slot st)) token (= token (:nomination-token st)))
+                            (assoc :durable-nomination (:sent-nomination st) :nomination-token nil)
+                            (and (= (:epoch input) (:slot st)) token (= token (:ballot-token st)))
+                            (assoc :durable-ballot (:sent-ballot st) :ballot-token nil)))
              st)
         replies (:replies st)
         st (-> st refresh-own settle update-heard-from-quorum)]
@@ -1571,6 +1577,10 @@
         {:id (:peer-id cfg)
          :qset qset
          :qset-hash h
+         :qset-served #{}
+         :qset-response-size (alength (wire/signing-bytes {:kind :qset :hash h :qset qset}))
+         :qset-reply-limit (:qset-reply-limit cfg)
+         :qset-reply-bytes (:qset-reply-bytes cfg)
          ;; Our own quorum set is always resolvable; peers' are not, and
          ;; `:qsets` lets a test pre-seed the cache to isolate fetching.
          :known-qsets (merge {h qset}
@@ -1596,8 +1606,10 @@
          :rule-passes 0
          :gossip-seq 0
          :write-seq 0
-         :sent-nomination nil
-         :sent-ballot nil
+         :sent-nomination (:sent-nomination restored)
+         :sent-ballot (:sent-ballot restored)
+         :durable-nomination (:sent-nomination restored)
+         :durable-ballot (:sent-ballot restored)
          :nomination-timeout (:nomination-timeout cfg)
          :ballot-timeout (:ballot-timeout cfg)
          :timeout-cap (:timeout-cap cfg)
@@ -1686,24 +1698,23 @@
   (:rule-passes st))
 
 (defn intertwined?
-  "Do `qsets` (a map node -> quorum set) enjoy quorum intersection among
-  themselves?
-
-  This is the FBA analogue of `n > 3f`, and it is what the safety theorem is
-  conditioned on: two nodes are guaranteed never to externalize contradictory
-  values only if every pair of their quorums intersects. Exponential in the
-  number of nodes, so it is a test oracle, not something a node computes."
-  [qsets]
-  (let [nodes (vec (sort-by pr-str (keys qsets)))
-        subsets (fn [] (for [mask (range (bit-shift-left 1 (count nodes)))]
-                         (into #{} (keep-indexed (fn [i n]
-                                                   (when (bit-test mask i) n))
-                                                 nodes))))
-        quorum? (fn [s]
-                  (and (seq s)
-                       (every? (fn [n] (when-let [q (get qsets n)]
-                                         (quorum-slice? q s)))
-                               s)))
-        qs (filter quorum? (subsets))]
-    (every? (fn [[a b]] (seq (set/intersection a b)))
-            (for [a qs b qs] [a b]))))
+  "Small-network oracle for quorum intersection. With `faulty` supplied, every
+  pair of quorums must share a node outside that set. Returns false when no
+  quorum exists. Enumeration is exponential and limited to sixteen nodes."
+  ([qsets] (intertwined? qsets #{}))
+  ([qsets faulty]
+   (let [nodes (vec (keys qsets))
+         universe (set nodes)]
+     (when (> (count nodes) 16)
+       (throw (ex-info "quorum intersection oracle supports up to 16 nodes" {:nodes (count nodes)})))
+     (boolean
+      (and (seq (survivors universe qsets false))
+           (every?
+            (fn [mask]
+              (let [q (into #{} (keep-indexed (fn [i n] (when (bit-test mask i) n))) nodes)]
+                (or (not-every? #(quorum-slice? (qsets %) q) q)
+                    ;; A second quorum sharing no honest member of q must
+                    ;; survive entirely inside this complement.
+                    (empty? (survivors (set/difference universe (set/difference q faulty))
+                                       qsets false)))))
+            (range 1 (bit-shift-left 1 (count nodes)))))))))

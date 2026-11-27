@@ -127,6 +127,16 @@
    :confidence (vec (repeat (clojure.core/count (termination-conditions params)) 0))
    :finalized? false})
 
+(defn- run-termination
+  "Update each condition's counter in the caller's configured order."
+  [sf votes]
+  (reduce (fn [st [i {:keys [alpha-confidence beta]}]]
+            (let [c (if (>= votes alpha-confidence) (inc (get-in st [:confidence i])) 0)
+                  st (assoc-in st [:confidence i] c)]
+              (if (>= c beta) (reduced (assoc st :finalized? true)) st)))
+          sf
+          (map-indexed vector (termination-conditions (:params sf)))))
+
 (defn snowflake-record-poll
   "Apply a poll result: `votes` for `choice` out of k.
 
@@ -150,19 +160,7 @@
       (let [flipped? (not= choice (:preference sf))
             sf (cond-> sf flipped? (assoc :confidence (vec (repeat (clojure.core/count tcs) 0))))
             sf (assoc sf :preference choice)]
-        (loop [i 0, sf sf]
-          (if (>= i (clojure.core/count tcs))
-            sf
-            (let [{:keys [alpha-confidence beta]} (nth tcs i)]
-              (if (< votes alpha-confidence)
-                ;; Clear this counter and every stricter one, then stop.
-                (assoc sf :confidence
-                       (vec (map-indexed (fn [j c] (if (>= j i) 0 c)) (:confidence sf))))
-                (let [c' (inc (nth (:confidence sf) i))
-                      sf (assoc-in sf [:confidence i] c')]
-                  (if (>= c' beta)
-                    (assoc sf :finalized? true)
-                    (recur (inc i) sf)))))))))))
+        (run-termination sf votes)))))
 
 (defn snowflake-record-unsuccessful-poll
   "A poll that failed to reach alpha-preference. Clears confidence; `finalized?`
@@ -230,29 +228,6 @@
 ;; the Tree's path, and `SnowflakeFactory` is what a running node passes in
 ;; anyway. See the note at the top of this namespace.
 ;; ============================================================
-
-(defn- run-termination
-  "The shared tail of both `record-poll`s: walk the termination conditions,
-  incrementing while `votes` clears each alpha and clearing this counter and
-  every stricter one at the first it does not.
-
-  Identical in `nnary_snowflake.go:74-88`, `unary_snowflake.go:45-64` and
-  `binary_snowflake.go:63-79`, which is why it is factored out here and was
-  not worth factoring out there."
-  [sf votes]
-  (let [tcs (termination-conditions (:params sf))]
-    (loop [i 0, sf sf]
-      (if (>= i (clojure.core/count tcs))
-        sf
-        (let [{:keys [alpha-confidence beta]} (nth tcs i)]
-          (if (< votes alpha-confidence)
-            (assoc sf :confidence
-                   (vec (map-indexed (fn [j c] (if (>= j i) 0 c)) (:confidence sf))))
-            (let [c' (inc (nth (:confidence sf) i))
-                  sf (assoc-in sf [:confidence i] c')]
-              (if (>= c' beta)
-                (assoc sf :finalized? true)
-                (recur (inc i) sf)))))))))
 
 (defn unary-snowflake
   "A unary instance: no choice at all, only confidence that the bits it covers

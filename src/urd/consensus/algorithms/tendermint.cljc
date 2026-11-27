@@ -81,7 +81,8 @@
             [hasch.core :as hasch]
             [urd.consensus.proposer :as proposer]
             [urd.consensus.reconfig :as reconfig]
-            [urd.consensus.signing :as signing]))
+            [urd.consensus.signing :as signing]
+            [urd.wire :as wire]))
 
 ;; ============================================================
 ;; Value identity
@@ -95,14 +96,36 @@
 (defn value-id
   "`id(v)`. A map carrying `:id` supplies its own; anything else is its own id.
 
-  Deliberately not a hash: `hasch/sha256` is synchronous on both platforms so
-  hashing here would be legal, but it would force every test value through an
-  opaque digest for no gain. A real deployment supplies `:id`."
+  An explicit id is part of the existing vote format. For structured values,
+  deployments must supply a deterministic :valid-fn that recomputes the
+  canonical identifier from the entire consensus payload, including validator
+  updates. All accepted values sharing an id must be identical."
   [v]
   (cond
     (nil? v) nil
     (and (map? v) (contains? v :id)) (:id v)
     :else v))
+
+(defn content-id
+  "Lowercase hexadecimal SHA-256 of a proposal map's canonical CBOR payload.
+
+  Build a proposal with (assoc payload :id (content-id payload)). Every
+  top-level field except :id participates, including :validator-updates."
+  [proposal]
+  (when-not (map? proposal)
+    (throw (ex-info "content-id requires a proposal map" {})))
+  (-> (dissoc proposal :id) wire/signing-bytes hasch/sha256 hasch/hash->str))
+
+(defn valid-content-id?
+  "A :valid-fn for deployments using content-id. Compose with the application's
+  schema, transaction, and reconfiguration checks, e.g. (every-pred
+  valid-content-id? application-valid?). All validators must agree on the
+  accepted payload representation."
+  [proposal]
+  (and (map? proposal)
+       (string? (:id proposal))
+       (try (= (:id proposal) (content-id proposal))
+            (catch #?(:clj Exception :cljs :default) _ false))))
 
 ;; ============================================================
 ;; Membership: BFT quorums by voting power
@@ -764,7 +787,7 @@
       ;; L15-18: re-propose validValue if we have one, otherwise ask the
       ;; application. `getValue()` is synchronous in the paper and an EFFECT
       ;; here, so the proposal is finished by the `value-ready` event.
-      (if-let [vv (:valid-value st)]
+      (if-some [vv (:valid-value st)]
         (broadcast-proposal st vv (:valid-round st))
         (-> st
             (assoc :awaiting-value {:height (:height st) :round r})
@@ -912,7 +935,8 @@
   enough peers agree. See `corroborated?` for why f+1 is the threshold."
   [st from {:keys [height decision cert]}]
   (if (or (not= height (:height st))
-          (contains? (:decisions st) height))
+          (contains? (:decisions st) height)
+          (not (valid? st decision)))
     st
     ;; A VERIFIED certificate is evidence, so one peer is enough and no claim
     ;; needs to be recorded at all. Checked before the claim is filed, because
@@ -926,7 +950,7 @@
           (assoc-in [:certificates height] cert)
           (decide (:round st) decision))
       (let [st (assoc-in st [:catchup-claims height from] decision)]
-        (if (corroborated? st height (value-id decision))
+        (if (corroborated? st height decision)
           (-> st
               (log-line :info (str (:id st) " catching up to height " height
                                    " on f+1 corroborated claims"))
@@ -945,7 +969,7 @@
   is lagging by more than 1, send Commit\" -- at any lag down to
   `blockStoreBase`."
   [st from h]
-  (if-let [v (get (:decisions st) h)]
+  (if-some [v (get (:decisions st) h)]
     (emit st (node/send-to from
                            (cond-> {:type :catchup :from (:id st)
                                     :height h :decision v}
@@ -966,9 +990,9 @@
   honest node, and an honest node only ever claims a value it decided, so the
   claim is true. It costs one extra round trip against CometBFT's single
   authenticated Commit, and needs no new cryptography."
-  [st h vid]
+  [st h decision]
   (let [claims (get-in st [:catchup-claims h] {})
-        agreeing (keep (fn [[peer claimed]] (when (= vid (value-id claimed)) peer))
+        agreeing (keep (fn [[peer claimed]] (when (= decision claimed) peer))
                        claims)]
     (node/v-blocking? (:membership st) st
                       (map (fn [p] {:from p}) agreeing)
@@ -993,8 +1017,9 @@
                              (when (and (= vid (:value-id m)) (:att m))
                                [voter (:att m)])))
                      (into {}))]
-      (when (seq votes)
-        {:height (:height st) :round r :value-id vid :votes votes}))))
+      (let [cert {:height (:height st) :round r :value-id vid :votes votes}]
+        (when (valid-certificate? st cert (:height st) vid)
+          cert)))))
 
 (defn valid-certificate?
   "Does `cert` prove that 2f+1 of OUR validators precommitted `vid` at `[h r]`?
@@ -1024,7 +1049,9 @@
   the network and a malformed certificate is a packet, not an error."
   [st cert h vid]
   (boolean
-   (and (map? cert)
+   (and (some? vid)
+        (map? cert)
+        (nat-int? (:round cert))
         (:verify-vote st)
         (= h (:height cert))
         (= vid (:value-id cert))
@@ -1034,8 +1061,8 @@
               good (->> (:votes cert)
                         (keep (fn [[voter att]]
                                 (when (and (contains? vset voter)
-                                           (try ((:verify-vote st) voter
-                                                                   (vote-payload h r vid) att)
+                                           (try (true? ((:verify-vote st) voter
+                                                                          (vote-payload h r vid) att))
                                                 (catch #?(:clj Exception :cljs :default) _ false)))
                                   {:from voter})))
                         vec)]
@@ -1379,9 +1406,10 @@
 
 (defn- handle-value-ready
   "The application supplied a value for the proposal we owe."
-  [st v]
+  [st v context]
   (let [{:keys [height round]} (:awaiting-value st)]
     (if (and height
+             (or (nil? context) (= context (:awaiting-value st)))
              (= height (:height st))
              (= round (:round st))
              (= :propose (:step st)))
@@ -1404,128 +1432,28 @@
         retention (:wal-retention st)
         cp? (boolean (and end-h retention
                           (>= (- end-h (:checkpointed-through st 0)) retention)))
-        ;; What the WAL would have to be replayed to reconstruct, written down
-        ;; instead. `:last-commit` is computed the way `replay-one` computes it
-        ;; at an `:end-height` -- from the messages we signed at the height now
-        ;; closing -- because `advance-height` has not run yet: it runs when
-        ;; this very write lands.
+        ;; Save the activated set and its priorities *before* the normal
+        ;; next-height proposer increment. Restore applies that increment once.
+        boundary (when (some? end-h)
+                   (merge (select-keys st [:validators :powers :priorities])
+                          (:config (activate-updates st end-h))
+                          {:decided-through end-h :post-activation? true}))
         cp-writes (when cp?
-                    (cond-> {:decided-through end-h
-                             :decisions (:decisions st)
-                             :priorities (:priorities st)
-                             :validators (:validators st)
-                             :powers (:powers st)
-                             :last-commit (own-messages-at-height st)}
+                    (cond-> (assoc boundary
+                                   :decisions (:decisions st)
+                                   :last-commit (own-messages-at-height st))
                       (:last-signed st) (assoc :last-signed (:last-signed st))))
         st (cond-> st cp? (assoc :checkpointed-through end-h))
         persists (mapv (fn [{:keys [token msg epoch then last-signed]}]
-                         ;; One write per message, each with its own
-                         ;; caller-supplied token. Raft had to assume the
-                         ;; interpreter completes writes in issue order because
-                         ;; it could not name its own writes; here the token is
-                         ;; the correlation, so several signed messages can be
-                         ;; in flight at once without ambiguity.
-                         ;; `:last-signed` is a SEPARATE durable key, not part
-                         ;; of the WAL record. CometBFT keeps this state in a
-                         ;; file distinct from the WAL
-                         ;; (`privval/file.go:74-83`) precisely because it is
-                         ;; the one thing that must survive a WAL wipe: a
-                         ;; validator that loses its WAL can re-derive
-                         ;; everything else, but one that loses this can be
-                         ;; slashed. Deriving it from the WAL -- as this did --
-                         ;; put it back inside the thing it must outlive, so a
-                         ;; truncated WAL prefix reset the guard to nil and the
-                         ;; node was free to re-sign a height it had already
-                         ;; voted at.
-                         ;; `:decided-through` is the same argument applied to
-                         ;; the HEIGHT. The WAL was the sole source of it --
-                         ;; `replay-one` derives `:height` only from
-                         ;; `:end-height` markers -- so a rotated or truncated
-                         ;; WAL restarted the node at height 0. That used to
-                         ;; look like a silent brick (the double-sign guard,
-                         ;; correctly restored from its own key, then refused
-                         ;; every signature); with catch-up working it became
-                         ;; worse, because the node cheerfully re-committed
-                         ;; every height from 0 -- measured, a duplicate
-                         ;; delivery of height 0 to the application.
-                         ;;
-                         ;; CometBFT never derives the consensus height from
-                         ;; the WAL: `stateBlockHeight := state.LastBlockHeight`
-                         ;; comes from the state store (`replay.go:307`), and a
-                         ;; WAL missing the expected `#ENDHEIGHT` is a loud
-                         ;; failure (`replay.go:135`) rather than a silent
-                         ;; restart from zero.
-                         (node/persist-then (cond-> {:writes (cond-> {:wal msg}
-                                                               last-signed
-                                                               (assoc :last-signed last-signed)
-                                                               (= :end-height (:type msg))
-                                                               (merge
-                                                                {:decided-through (:height msg)
-                                                              ;; The proposer priorities AS OF the
-                                                              ;; height being closed -- the same
-                                                              ;; height `:decided-through` names, so
-                                                              ;; the two are read back together and
-                                                              ;; advanced together. See `init`.
-                                                                 :priorities (:priorities st)
-                                                              ;; And the SET, for the same reason.
-                                                              ;; Once a decided value can change it,
-                                                              ;; the set is durable state rather
-                                                              ;; than configuration -- a restart
-                                                              ;; that read it from the config file
-                                                              ;; would silently revert every change
-                                                              ;; the network had agreed.
-                                                              ;;
-                                                              ;; POST-activation, which is the whole
-                                                              ;; point and was the bug. This write
-                                                              ;; is issued when the `:end-height`
-                                                              ;; marker is SIGNED; `activate-updates`
-                                                              ;; runs later, in `advance-height`,
-                                                              ;; when the write lands. Persisting
-                                                              ;; `(:validators st)` therefore stored
-                                                              ;; the set as it was BEFORE the change
-                                                              ;; the decision carried, and `init`
-                                                              ;; never re-applies it -- so a restart
-                                                              ;; in that window reverted the set
-                                                              ;; permanently, not for one height.
-                                                              ;;
-                                                              ;; Measured: a restarted node ran
-                                                              ;; `byzantine-threshold(4) = 3` while
-                                                              ;; the network ran 4, dropped the new
-                                                              ;; validator's messages as
-                                                              ;; non-validator traffic, and diverged
-                                                              ;; on proposer selection from height 8
-                                                              ;; onward -- after which every
-                                                              ;; proposal it saw failed
-                                                              ;; `proposal-from-proposer` and it
-                                                              ;; prevoted nil forever. Symmetrically
-                                                              ;; a REMOVED validator kept being
-                                                              ;; counted.
-                                                              ;;
-                                                              ;; `activate-updates` is a pure
-                                                              ;; function of the config and the
-                                                              ;; decision, both of which are already
-                                                              ;; in `st` here, so computing it early
-                                                              ;; cannot disagree with what
-                                                              ;; `advance-height` will compute --
-                                                              ;; and on the refusal path it returns
-                                                              ;; no `:config`, so the old set is
-                                                              ;; persisted, which is what the node
-                                                              ;; will also keep.
-                                                                 }
-                                                                (let [{:keys [config]}
-                                                                      (activate-updates st (:height msg))]
-                                                                  {:validators (or (:validators config)
-                                                                                   (:validators st))
-                                                                   :powers (or (:powers config)
-                                                                               (:powers st))})))
-                                                     :durable? true
-                                                     :epoch epoch
-                                                     :token token
-                                                     :then then}
-                                              (and cp? (= :end-height (:type msg)))
-                                              (assoc :checkpoint
-                                                     [{:writes cp-writes
-                                                       :durable? true}]))))
+                         (let [end? (= :end-height (:type msg))
+                               writes (cond-> {:wal msg}
+                                        last-signed (assoc :last-signed last-signed)
+                                        end? (merge boundary))]
+                           (node/persist-then
+                            (cond-> {:writes writes :durable? true
+                                     :epoch epoch :token token :then then}
+                              (and cp? end?)
+                              (assoc :checkpoint [{:writes cp-writes :durable? true}])))))
                        signed)]
     (node/result st (vec (concat logs msgs persists)))))
 
@@ -1588,7 +1516,12 @@
   "Fold the ordered log of landed writes into restored state."
   [acc writes]
   (reduce (fn [acc {w :writes}]
-            (if-let [msg (:wal w)] (replay-one acc msg) acc))
+            (cond
+              (:wal w) (replay-one acc (:wal w))
+              (contains? w :decided-through)
+              (assoc acc :height (inc (:decided-through w))
+                     :checkpointed-through (:decided-through w))
+              :else acc))
           acc
           (or writes [])))
 
@@ -1608,6 +1541,43 @@
 ;; ============================================================
 ;; The Node implementation
 ;; ============================================================
+
+(defn- restored-boundary
+  "Upgrade the validator state of a legacy boundary using its original record."
+  [{:keys [durable writes]}]
+  (let [boundary (some (fn [{w :writes}] (when (contains? w :decided-through) w))
+                       (rseq (vec writes)))]
+    (cond
+      (:post-activation? durable) durable
+
+      ;; Legacy checkpoints captured the entire pre-activation configuration.
+      (and boundary (:decisions boundary) (nil? (:wal boundary)))
+      (merge durable (:config (activate-updates boundary (:decided-through boundary))))
+
+      ;; Legacy ordinary writes stored the new members but old priorities.
+      (and (:priorities durable) (:powers durable) (:validators durable))
+      (let [{:keys [priorities powers validators]} durable
+            joining (remove #(contains? priorities %) validators)
+            penalty (proposer/new-validator-priority (proposer/total-power powers))]
+        (assoc durable :priorities (merge (select-keys priorities validators)
+                                          (zipmap joining (repeat penalty)))))
+
+      :else durable)))
+
+(defn- replay-delivery [st delivered]
+  (when (and (some? delivered) (not (nat-int? delivered)))
+    (throw (ex-info "Tendermint :delivered-through must be a non-negative integer"
+                    {:delivered-through delivered})))
+  (if (and (some? delivered) (< delivered (:height st)))
+    (let [vertices (mapv (fn [h]
+                           (if (contains? (:decisions st) h)
+                             (get (:decisions st) h)
+                             (throw (ex-info "Tendermint decision needed for application replay is unavailable"
+                                             {:height h :delivered-through delivered
+                                              :consensus-height (:height st)}))))
+                         (range delivered (:height st)))]
+      (emit st (node/commit vertices)))
+    st))
 
 (def default-config
   {:timeout-propose 10
@@ -1659,7 +1629,8 @@
      :topics #{:consensus}})
 
   (init [_ config]
-    (let [cfg (merge default-config config)
+    (let [cfg (assoc-in (merge default-config config) [:restored :durable]
+                        (restored-boundary (:restored config)))
           ;; The DURABLE set wins over the configured one.
           ;;
           ;; Once a decided value can change the validator set, the set is state
@@ -1831,6 +1802,7 @@
           own (:own-messages st)
           st (assoc st :own-messages [])
           st (fresh-fx st)
+          st (replay-delivery st (:delivered-through cfg))
           st (reduce record-message st own)
           st (log-line st :info
                        (str "tendermint " (:id st) " [validators: " validators
@@ -1878,7 +1850,7 @@
           :message-received (ingest st (:from input) (:msg input) (:verified-by input))
           :timer-fired (handle-timer st (:timer-id input))
           :persisted (handle-persisted st (:token input) (:epoch input))
-          :value-ready (handle-value-ready st (:value input))
+          :value-ready (handle-value-ready st (:value input) (:context input))
           st))))))
 
 (defn make

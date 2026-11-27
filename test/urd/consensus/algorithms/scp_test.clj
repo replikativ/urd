@@ -1074,27 +1074,24 @@
         (is (contains? (:known-qsets got) h)
             "while the answer to a fetch we issued is still taken")))))
 
-(deftest a-qset-is-only-served-to-a-node-in-our-slices
-  (testing "`:get-qset` answered anyone, from a cache anyone could fill, and
-            the reply is a `send-to` -- which the runtime emulates as a
-            BROADCAST. A ~50-byte request therefore put a quorum set of up to
-            `max-qset-nodes` entries on the wire to every peer, unthrottled and
-            repeatable.
-
-           A peer outside our slices has no use for our preimages: it cannot be
-           part of any fixpoint we evaluate."
-    (let [impl (scp/make)
-          {st :state} (node/init impl {:peer-id :a :qset flat-qset
-                                       :qsets {:a flat-qset} :slot 0})
-          h (scp/qset-hash flat-qset)
-          st (assoc-in st [:known-qsets h] flat-qset)
-          ask (fn [who]
-                (:effects (node/step impl st (node/message-received
-                                              who {:kind :get-qset :hash h} #{who}))))]
-      (is (seq (filter #(= :send (node/effect-kind %)) (ask :b)))
-          "a node in our own quorum set is served")
-      (is (empty? (filter #(= :send (node/effect-kind %)) (ask :stranger)))
-          "and a stranger gets nothing, however often it asks"))))
+(deftest own-qset-is-served-with-a-shared-gossip-window-budget
+  (let [impl (scp/make)
+        init (fn [cfg] (:state (node/init impl (merge {:peer-id :a :qset flat-qset} cfg))))
+        h (scp/qset-hash flat-qset)
+        ask (fn [st peer hash]
+              (node/step impl st (node/message-received peer {:kind :get-qset :hash hash} #{peer})))
+        reply? (fn [r] (some #(= :qset (get-in (node/effect-params %) [:msg :kind])) (:effects r)))
+        st (init {:qset-reply-limit 2})
+        first-reply (ask st :outside h)
+        second-reply (ask (:state first-reply) :another h)
+        expired (node/step impl (:state second-reply) (node/timer-fired :gossip))]
+    (is (reply? first-reply) "a validator can trust us without reciprocal membership")
+    (is (not (reply? (ask (:state first-reply) :outside h))))
+    (is (reply? second-reply))
+    (is (not (reply? (ask (:state second-reply) :third h))))
+    (is (reply? (ask (:state expired) :outside h)))
+    (is (not (reply? (ask (init {:qset-reply-bytes 1}) :outside h))))
+    (is (not (reply? (ask st :outside :unknown))))))
 
 (deftest a-nomination-carrying-too-many-values-is-refused
   (testing "`nomination-rule` runs `federated-accept` ONCE PER DISTINCT VALUE,
@@ -1126,3 +1123,62 @@
                              :votes (into #{} (take 200 many))
                              :accepted (into #{} (take 200 (drop 200 many)))})))
           "the cap is over votes AND accepted together, since both are walked"))))
+
+(deftest self-omitting-federation-nominates-without-preloaded-sets
+  (let [qsets (into {} (for [p flat-peers]
+                         [p {:threshold 2 :validators (vec (remove #{p} flat-peers))}]))
+        s (run-to-consensus qsets {:seed-qsets? false :ticks 500})]
+    (is (every? some? (vals (externalized-by s))))
+    (is (= 1 (count (set (vals (externalized-by s))))))))
+
+(deftest gossip-replays-only-statements-with-completed-writes
+  (let [impl (scp/make)
+        cfg {:peer-id :a :qset {:threshold 2 :validators [:a :b]} :value :v}
+        init (node/init impl cfg)
+        [st more] (speak-up impl (:state init))
+        effect (first (filter #(= :persist-then (node/effect-kind %))
+                              (concat (:effects init) more)))
+        w (node/effect-params effect)
+        gossip (fn [st] (node/step impl st (node/timer-fired :gossip)))
+        kinds (fn [r] (mapv node/effect-kind (:effects r)))
+        pending (gossip st)
+        landed (node/step impl (:state pending) (node/persisted (:token w) (:epoch w)))
+        stable (gossip (:state landed))
+        mixed (gossip (scp/bump-state (:state landed) :v 1))
+        repeated (gossip (:state mixed))
+        messages (fn [fx] (map #(get-in (node/effect-params %) [:msg :kind])
+                               (filter #(= :broadcast (node/effect-kind %)) fx)))
+        restart (node/init impl (assoc cfg :restored {:durable (:writes w)}))]
+    (is (some? effect))
+    (is (not-any? #{:broadcast :persist-then} (kinds pending)))
+    (is (some #{:broadcast} (kinds stable)))
+    (is (not-any? #{:persist-then} (kinds stable)))
+    (is (= [:nominate] (messages (:effects mixed))))
+    (is (= [:prepare] (messages (mapcat node/deferred-effects (:effects mixed)))))
+    (is (= [:nominate] (messages (:effects repeated))))
+    (is (not-any? #{:persist-then} (kinds repeated)))
+    (is (not-any? #{:persist-then} (kinds restart)))
+    (is (some #{:broadcast} (kinds (gossip (:state restart)))))))
+
+(deftest quorum-intersection-requires-a-quorum-and-an-honest-intersection
+  (is (false? (scp/intertwined? {})))
+  (is (false? (scp/intertwined? {:a {:threshold 1 :validators [:absent]}})))
+  (is (scp/intertwined? flat-qset-config #{:a}))
+  (is (false? (scp/intertwined? flat-qset-config #{:a :b}))))
+
+(deftest asymmetric-observer-discovers-the-quorum-set
+  (let [observer-qset {:threshold 2 :validators [:a :b :c]}
+        qsets (assoc flat-qset-config :observer observer-qset)
+        s (run-to-consensus qsets {:seed-qsets? false :ticks 500})]
+    (is (every? some? (vals (externalized-by s))))
+    (is (= 1 (count (set (vals (externalized-by s))))))
+    (is (= flat-qset (get-in (sim/node-state s :observer)
+                             [:known-qsets (scp/qset-hash flat-qset)])))))
+
+(deftest externalized-gossip-stops-growing-the-store
+  (let [s (sim/run (make-sim flat-qset-config {}) 150)
+        writes (fn [s] (count (get-in s [:storage :a :writes])))
+        later (sim/run s 100)]
+    (is (some? (scp/externalized (sim/node-state s :a))))
+    (is (pos? (writes s)))
+    (is (= (writes s) (writes later)))))

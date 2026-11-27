@@ -380,6 +380,40 @@
       (is (= 1 (get-in st' [:rejected :malformed])))
       (is (nil? (get-in st' [:dag 1 :b]))))))
 
+(deftest certificate-votes-require-a-signer-keyed-map
+  (let [st (node-init {})
+        c (cert* {:author :b :round 1 :payload nil :parents (ids-at st 0 vs)} vs)]
+    (is (bs/well-formed? st c))
+    (is (false? (bs/well-formed? st (update c :votes vec))))))
+
+(deftest late-certificates-stay-below-the-authors-committed-watermark
+  (let [st (-> (node-init {}) (assoc :last-committed-round 2)
+               (assoc-in [:last-committed :b] 2))
+        late (cert* {:author :b :round 1 :payload nil :parents (ids-at st 0 vs)} vs)
+        after (:state (insert st late))]
+    (is (= late (get-in after [:certificates (:id late)])))
+    (is (nil? (get-in after [:dag 1 :b])))))
+
+(deftest retransmissions-wait-for-the-slot-to-be-durable
+  (let [st (node-init {})
+        node (bs/create)
+        kinds (fn [state event] (mapv n/effect-kind (:effects (n/step node state event))))
+        header {:author :b :round 1 :payload nil :parents (ids-at st 0 vs)}
+        receive (n/message-received :b {:kind :header :header header} #{:b})
+        propose (n/value-ready :payload)
+        gossip (n/timer-fired :gossip)]
+    (doseq [[event expected] [[receive :send] [propose :broadcast]]]
+      (let [{reserved :state fx :effects} (n/step node st event)
+            write (n/effect-params (first fx))
+            landed (:state (n/step node reserved (n/persisted (:token write) nil)))]
+        (is (= [:persist-then] (mapv n/effect-kind fx)))
+        (is (= [expected] (mapv n/effect-kind (:then write))))
+        (is (empty? (kinds reserved event)))
+        (is (= [expected] (kinds landed event)))
+        (when (= event propose)
+          (is (= [:set-timer] (kinds reserved gossip)))
+          (is (= [:broadcast :set-timer] (kinds landed gossip))))))))
+
 (deftest a-certificate-with-a-forged-digest-is-rejected
   (let [st (node-init {})
         parents (into #{} (map :id) (vals (get-in st [:dag 0])))

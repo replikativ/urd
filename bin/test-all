@@ -62,15 +62,7 @@ run "clojurescript (:cljs-test)"   bash -c 'clojure -M:cljs-test && node target/
 # runs against a released coordinate and is gated in CI too.
 run "machine-checked proofs (:proofs)" clojure -M:proofs
 
-if [ -d ../konserve ]; then
-  run "storage faults (:storage-sim)" clojure -M:storage-sim
-else
-  echo
-  echo "=== storage faults (:storage-sim) ==="
-  echo "--- SKIPPED: needs a konserve checkout at ../konserve"
-  echo "    (konserve.simulation.* is unreleased; see deps.edn)"
-  status=1
-fi
+run "storage faults (:storage-sim)" clojure -M:storage-sim
 
 echo
 if [ $status -eq 0 ]; then echo "ALL SUITES PASSED"; else echo "SOMETHING FAILED OR WAS SKIPPED"; fi

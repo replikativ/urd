@@ -39,14 +39,9 @@
   which is the one path that is hard to test and where being wrong is worst.
   One key has no such window.
 
-  ## What is NOT here
-
-  Compaction. The log grows without bound, so a node that runs long enough
-  restarts slowly and eventually not at all. The simulator has the same
-  property and neither has needed a snapshot-and-truncate cycle yet. It is a
-  real bound, and it is written down rather than discovered later: nothing in
-  this namespace should be read as claiming a store you can leave running for a
-  year."
+  A checkpoint replaces the retained log with records supplied by the
+  algorithm. Writes, checkpoints and subsequent reads must observe issue
+  order. A backend can discard older records once the replacement is durable."
   (:require #?(:clj  [clojure.core.async :refer [go]]
                :cljs [clojure.core.async :refer [go]])
             [superv.async :refer [go-try- <?-]]))
@@ -142,9 +137,10 @@
   algorithm that has not moved to `fold` working exactly as before, rather
   than making a heap fix into a rewrite of seven state machines."
   [store]
-  (go-try-
-   (let [records (<?- (fold store conj []))]
-     {:durable (merge-durable records) :writes records})))
+  (let [pending (fold store conj [])]
+    (go-try-
+     (let [records (<?- pending)]
+       {:durable (merge-durable records) :writes records}))))
 
 (defrecord MemoryStore [state]
   DurableStore
@@ -154,7 +150,8 @@
     (go true))
 
   (fold [_ f init]
-    (go (reduce f init @state)))
+    (let [snapshot @state]
+      (go-try- (reduce f init snapshot))))
 
   (restore [this] (restore-via-fold this))
 

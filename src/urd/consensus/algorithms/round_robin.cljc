@@ -494,8 +494,9 @@
   (let [pid (proposal-id proposal)
         {:keys [height round]} state]
     (cond
-      (nil? pid)
-      (n/result state [(log state :warn "application supplied a proposal with no :snapshot-id")])
+      (or (not (am-proposer? state))
+          (not (valid-proposal? state proposal height round)))
+      (n/result state [(log state :warn "ignoring invalid or unsolicited application proposal")])
 
       ;; Already proposing for this height. Re-broadcast what we committed to
       ;; rather than replacing it -- the peers that voted for it are right.
@@ -507,16 +508,29 @@
                                           :height height :round round})])
 
       :else
-      (n/result (-> state
-                    (assoc :current-proposal proposal
-                           :current-proposal-id pid
-                           :phase :voting)
-                    (record-vote pid (:peer-id state)
-                                 ((:sign-vote state) (:peer-id state)
-                                                     (vote-payload state pid))))
-                [(n/broadcast :proposals {:kind :proposal :proposal proposal
-                                          :height height :round round})
-                 (n/set-timer :quorum-timeout (:quorum-timeout state))]))))
+      (maybe-finalize (-> state
+                          (assoc :current-proposal proposal
+                                 :current-proposal-id pid
+                                 :phase :voting)
+                          (record-vote pid (:peer-id state)
+                                       ((:sign-vote state) (:peer-id state)
+                                                           (vote-payload state pid))))
+                      pid
+                      [(n/broadcast :proposals {:kind :proposal :proposal proposal
+                                                :height height :round round})
+                       (n/set-timer :quorum-timeout (:quorum-timeout state))]))))
+
+(defn- adopt-proposal [state proposal height round]
+  (let [pid (proposal-id proposal)
+        voter (:peer-id state)
+        att ((:sign-vote state) voter (vote-payload state pid))]
+    (n/result (-> state
+                  (assoc :current-proposal proposal :current-proposal-id pid :phase :voting)
+                  (record-vote pid voter att))
+              [(n/cancel-timer :proposal-timeout)
+               (n/broadcast :votes {:kind :vote :proposal-id pid :voter voter
+                                    :att att :height height :round round})
+               (n/set-timer :quorum-timeout (:quorum-timeout state))])))
 
 (defn handle-proposal-received [state proposal height round sender]
   (cond
@@ -532,21 +546,7 @@
     (n/result state [(log state :debug "ignoring duplicate proposal")])
 
     (valid-proposal? state proposal height round)
-    (let [proposal-id (proposal-id proposal)]
-      (n/result (-> state
-                    (assoc :current-proposal proposal
-                           :current-proposal-id proposal-id
-                           :phase :voting)
-                    (record-vote proposal-id (:peer-id state)
-                                 ((:sign-vote state) (:peer-id state)
-                                                     (vote-payload state proposal-id))))
-                [(n/cancel-timer :proposal-timeout)
-                 (n/broadcast :votes {:kind :vote :proposal-id proposal-id
-                                      :voter (:peer-id state)
-                                      :att ((:sign-vote state) (:peer-id state)
-                                                               (vote-payload state proposal-id))
-                                      :height height :round round})
-                 (n/set-timer :quorum-timeout (:quorum-timeout state))]))
+    (adopt-proposal state proposal height round)
 
     :else
     (n/result state [(log state :debug "ignoring proposal for another height/round")])))
@@ -627,14 +627,14 @@
     ;; guard should not be able to fail open because a cache was not filled in.
     (and (= height (:height state))
          (:current-proposal state)
-         (not= (proposal-id proposal) (proposal-id (:current-proposal state))))
+         (not= proposal (:current-proposal state)))
     (n/result state
               [(log state :warn
                     (str "REFUSING a finalization for height " height
                          " naming " (proposal-id proposal)
                          " -- we hold " (proposal-id (:current-proposal state))))])
 
-    (= height (:height state))
+    (valid-proposal? state proposal height (:round state))
     ;; A peer reached quorum before we did, so we learn the decision from its
     ;; announcement and commit it ourselves. A node that already finalized this
     ;; height locally has moved on and takes the `:else` branch below, so no
@@ -739,21 +739,19 @@
       (n/result state [(log state :debug "catchup: proposal is not for our height/round")])
 
       (and (:current-proposal state)
-           (not= pid (proposal-id (:current-proposal state))))
+           (not= proposal (:current-proposal state)))
       (n/result state
                 [(log state :warn
                       (str "catchup: refusing a SECOND proposal for height " height
                            " -- we hold " (proposal-id (:current-proposal state))))])
 
       :else
-      (let [state (reduce (fn [s v] (record-vote s pid (:voter v) (:att v)))
-                          (assoc state :current-proposal proposal
-                                 :current-proposal-id pid
-                                 :phase :voting)
-                          (bounded-votes state votes))]
-        (maybe-finalize state pid
-                        [(log state :info (str "catchup: proposal with " (count votes)
-                                               " votes"))])))))
+      (let [st (reduce (fn [s v] (record-vote s pid (:voter v) (:att v)))
+                       state (bounded-votes state votes))]
+        (if (or (:current-proposal st) (empty? (get-in st [:votes pid])))
+          (maybe-finalize st pid [])
+          (let [{st :state effects :effects} (adopt-proposal st proposal height round)]
+            (maybe-finalize st pid (vec effects))))))))
 
 (defn handle-state-sync-response
   "Adopt a peer's finalized history -- and COMMIT what we learn from it.
@@ -825,43 +823,24 @@
   because the alternative is what this function used to do: jump, and look
   caught up."
   [state finalized-heights current-height oldest]
-  (let [ours (:finalized state)
-        merged (merge ours finalized-heights)
-        h0 (:height state)
-        learned (->> (iterate inc h0)
-                     (take-while #(contains? merged %))
-                     (remove #(contains? ours %))
-                     vec)
-        ;; Only what we actually LEARNED is kept, never the peer's whole map.
-        ;;
-        ;; `merged` is used to walk the contiguous run and then discarded.
-        ;; Storing it merged every entry a peer chose to send, at any height,
-        ;; with no size bound -- and `cleanup-old-data` prunes only BELOW
-        ;; `height - 10`, so entries above our height survived every future
-        ;; prune. `answer-state-sync` then re-served them, making each node a
-        ;; relay for whatever it had been fed. One broadcast could plant an
-        ;; arbitrary number of permanent entries on every node at once.
-        ;;
-        ;; The contiguous run is exactly what we emit commits for, so keeping
-        ;; that and nothing else also makes `:finalized` agree with what the
-        ;; consumer was told.
-        kept (reduce (fn [m h] (assoc m h (get merged h))) ours learned)
-        new-height (if (seq learned) (inc (apply max learned)) h0)
+  (let [h0 (:height state)
+        advanced (loop [st state]
+                   (let [h (:height st)
+                         proposal (get finalized-heights h)]
+                     (if (and (some? proposal)
+                              (valid-proposal? st proposal h (:round st))
+                              (or (nil? (:current-proposal st))
+                                  (= (:current-proposal st) proposal)))
+                       (recur (advance-height st h proposal))
+                       st)))
+        new-height (:height advanced)
+        learned (range h0 new-height)
         advanced? (> new-height h0)
         stranded? (and (not advanced?)
                        (some? oldest)
                        (> oldest h0)
                        (> current-height h0))]
-    (n/result (cond-> (assoc state :finalized kept :height new-height)
-                ;; Only when the height actually moved. At a NEW height the
-                ;; old proposal and its votes are meaningless and must go; at
-                ;; the same height they are live consensus state and this node
-                ;; may be the one proposer that owns them.
-                advanced? (assoc :round 0
-                                 :phase :proposing
-                                 :current-proposal nil
-                                 :current-proposal-id nil
-                                 :votes {}))
+    (n/result advanced
               (into [(if stranded?
                        (log state :warn
                             (str "state sync: cannot catch up from this peer -- we are at "
@@ -870,7 +849,7 @@
                        (log state :info (str "state sync: now at height " new-height
                                              ", learned " (count learned))))]
                     (concat
-                     (map (fn [h] (n/commit [(get merged h)])) learned)
+                     (map (fn [h] (n/commit [(get finalized-heights h)])) learned)
                      (when advanced?
                        [(n/set-timer :next-round (:next-round-delay state))])
                      ;; Arm a retry. `:sync-requested-at` is set to the current
@@ -1064,12 +1043,16 @@
     (case (:type input)
       :timer-fired (handle-timeout state (:timer-id input))
 
-      :value-ready (handle-value-ready state (:value input))
+      :value-ready (if (= (:height state) (get (:context input) :height (:height state)))
+                     (handle-value-ready state (:value input))
+                     (n/result state))
 
       :message-received
       (let [msg (:msg input)
             from (:from input)]
-        (if-not (well-formed? msg)
+        (if-not (and (well-formed? msg)
+                     (or (not (#{:finalized :state-sync-response} (:kind msg)))
+                         (valid-voter? from (:validator-set state))))
           (n/result state)
           (case (:kind msg)
             :proposal (handle-proposal-received state (:proposal msg) (:height msg)

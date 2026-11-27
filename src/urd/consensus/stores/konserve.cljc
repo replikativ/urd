@@ -56,96 +56,90 @@
   ::write-log)
 
 (def manifest-key
-  "Where the CURRENT log key is recorded.
-
-  Compaction cannot rewrite a log in place -- konserve's append log is a linked
-  chain of separate store keys -- so a checkpoint writes a fresh log and then
-  flips this one pointer. That flip is the atomic moment: a node that dies
-  before it comes back reading the old log, a node that dies after comes back
-  reading the new one, and neither can see a mixture."
+  "Legacy shared checkpoint manifest. Its :log-key identifies a physical log,
+  but older releases did not record which configured log owned it."
   ::manifest)
 
+(defn- scoped-manifest [logical-key]
+  [manifest-key logical-key])
+
 (defn- resolve-key!
-  "The log key this store is actually using, reading the manifest once.
-
-  Lazy rather than resolved in the constructor, and that is a portability
-  requirement rather than a preference: reading konserve is asynchronous on
-  both platforms, `konserve-store` returns a store synchronously, and blocking
-  to bridge the two works only on the JVM. Every caller here is already inside
-  a go block, so resolving on first use costs nothing.
-
-  A store that has been checkpointed names its own current log; reading the
-  default after a checkpoint would silently restore from an empty one."
-  [ks key-atom fallback]
+  "Resolve a logical log once, in the same queue that orders its operations."
+  [ks key-atom logical-key]
   (go-try-
-   (let [k @key-atom]
-     (if (= ::unresolved k)
-       (let [found (or (:log-key (<?- (k/get-in ks [manifest-key]))) fallback)]
-         (compare-and-set! key-atom ::unresolved found)
-         @key-atom)
-       k))))
+   (if (= ::unresolved @key-atom)
+     (let [scoped (scoped-manifest logical-key)
+           current (<?- (k/get-in ks [scoped]))
+           legacy (when-not current (<?- (k/get-in ks [manifest-key])))
+           legacy-key (:log-key legacy)
+           physical-key
+           (cond
+             current (or (:log-key current)
+                         (throw (ex-info "Invalid consensus log manifest" {:manifest scoped})))
+             (nil? legacy) logical-key
+             (nil? legacy-key) (throw (ex-info "Invalid legacy consensus manifest"
+                                               {:manifest manifest-key}))
+             (= logical-key default-log-key) legacy-key
+             :else (throw
+                    (ex-info
+                     (str "Legacy consensus manifest has no owner. Stop writers and inspect "
+                          "the legacy and requested logs. Copy the verified history into "
+                          "a private log, then set the scoped manifest to {:log-key private-log-key}.")
+                     {:requested-log logical-key :legacy-log legacy-key :manifest scoped})))]
+       (reset! key-atom physical-key))
+     @key-atom)))
 
-(defn- run-writer
-  "One writer, forever. Serializes appends; see the namespace docstring."
-  [ks log-key fallback-key queue]
+(defn- replace-log! [ks key-atom logical-key old-key records]
+  (go-try-
+   (let [new-key (keyword (namespace ::manifest) (str "write-log-" (random-uuid)))
+         ;; A legacy manifest may be the only way to recover an unidentified
+         ;; custom log. Preserve that source across the first scoped checkpoint.
+         legacy-key (:log-key (<?- (k/get-in ks [manifest-key])))]
+     (doseq [record records]
+       (<?- (k/append ks new-key record)))
+     (<?- (k/assoc-in ks [(scoped-manifest logical-key)] {:log-key new-key}))
+     (reset! key-atom new-key)
+     (when (not= old-key legacy-key)
+       (<?- (k/dissoc ks old-key)))
+     true)))
+
+(defn- run-writer [ks log-key fallback queue]
   (go-loop []
-    (when-let [[record reply] (<! queue)]
-      ;; DEREFERENCED per record, not captured once: a checkpoint replaces the
-      ;; log key underneath this loop, and an append that kept writing to the
-      ;; old key would land in a log nothing reads.
-      (let [result (<! (go-try- (<?- (k/append ks (<?- (resolve-key! ks log-key fallback-key))
-                                               record))
-                                true))]
-        ;; The append's outcome is reported to the caller rather than logged
-        ;; and swallowed. A `write!` that cannot say it failed is a barrier
-        ;; that cannot be trusted.
-        (put! reply (if (instance? #?(:clj Throwable :cljs js/Error) result)
-                      result
-                      true))
-        (close! reply))
-      (recur))))
+    (if-let [[operation reply] (<! queue)]
+      (let [result (<! (go-try-
+                        (let [key (<?- (resolve-key! ks log-key fallback))]
+                          (<?- (operation key)))))]
+        (when (some? result) (put! reply result))
+        (close! reply)
+        (recur))
+      true)))
 
-(defrecord KonserveStore [ks log-key fallback queue]
+(defn- submit! [queue operation]
+  (let [reply (chan 1)]
+    (put! queue [operation reply]
+          (fn [accepted?]
+            (when-not accepted?
+              (put! reply (ex-info "Consensus store is closed" {}))
+              (close! reply))))
+    reply))
+
+(defrecord KonserveStore [ks log-key logical-key queue writer]
   store/DurableStore
 
   (write! [_ record]
-    (let [reply (chan 1)]
-      (put! queue [record reply])
-      reply))
+    (submit! queue (fn [key] (go-try- (<?- (k/append ks key record)) true))))
 
   (fold [_ f init]
-    ;; A straight pass-through: `k/reduce-log` already streams the log with an
-    ;; accumulator and never builds the vector. That is the whole of the
-    ;; bounded-heap fix on this backend -- konserve had the primitive and urd
-    ;; was not using it, folding into `conj []` and handing the result on.
-    (go-try- (<?- (k/reduce-log ks (<?- (resolve-key! ks log-key fallback))
-                                f init))))
+    (submit! queue (fn [key] (k/reduce-log ks key f init))))
 
   (restore [this] (store/restore-via-fold this))
 
   (checkpoint! [_ records]
-    (go-try-
-     (let [old-key (<?- (resolve-key! ks log-key fallback))
-           new-key (keyword (namespace ::manifest)
-                            (str "write-log-" (System/currentTimeMillis)))]
-       ;; Write the whole new log FIRST, while the manifest still names the old
-       ;; one. Nothing reads `new-key` until the pointer moves, so a crash here
-       ;; leaves an orphan the sweep can collect and a node that comes back on
-       ;; the old log -- correct, merely uncompacted.
-       (doseq [r records]
-         (<?- (k/append ks new-key r)))
-       ;; THE atomic moment.
-       (<?- (k/assoc-in ks [manifest-key] {:log-key new-key}))
-       (reset! log-key new-key)
-       ;; Only now is the old log unreachable. Dissoc'ing it before the flip
-       ;; would open a window in which a crash left the manifest pointing at a
-       ;; log that had been swept.
-       (<?- (k/dissoc ks old-key))
-       true)))
+    (submit! queue (fn [key] (replace-log! ks log-key logical-key key records))))
 
   (close-store! [_]
     (close! queue)
-    (go true)))
+    writer))
 
 (defn konserve-store
   "Wrap a connected konserve store `ks`.
@@ -157,9 +151,9 @@
   ([ks] (konserve-store ks {}))
   ([ks {:keys [log-key] :or {log-key default-log-key}}]
    (let [queue (chan 64)
-         key-atom (atom ::unresolved)]
-     (run-writer ks key-atom log-key queue)
-     (->KonserveStore ks key-atom log-key queue))))
+         key-atom (atom ::unresolved)
+         writer (run-writer ks key-atom log-key queue)]
+     (->KonserveStore ks key-atom log-key queue writer))))
 
 #?(:clj
    (defn connect-fs-store!

@@ -686,7 +686,8 @@
     ;; Checked before anything hashes it; see `well-formed?`.
     (n/result (update-in state [:rejected :malformed] (fnil inc 0))
               [(n/log-effect :warn {:event :malformed-header :from from})])
-    (let [id (header-id header)]
+    (let [header (select-keys header [:version :time :bits :nonce :prev :merkle-root])
+          id (header-id header)]
       (cond
         (blk state id)
         (n/result state)
@@ -731,6 +732,9 @@
         (n/result (update-in state [:rejected :orphan-insane] (fnil inc 0))
                   [(n/log-effect :warn {:event :orphan-failed-sanity
                                         :from from})])
+
+        (contains? (:orphan-at state) id)
+        (n/result state (when from [(n/send-to from {:kind :get-header :id (:prev header)})]))
 
         ;; Unknown parent, but the work is real: park it, and ask whoever sent
         ;; it for the parent.
@@ -847,7 +851,7 @@
   (`mediantime.go:93-100`), and it survives a restart because it was never in
   the chain to begin with.
 
-  We have no wall clock -- `:now` is advanced by a timer, which is what makes
+  The simulator has no wall clock -- `:now` is advanced by a timer, which is what makes
   runs replayable -- so the honest fix within the model is to take the maximum
   of the configured clock and what the chain itself proves has already
   happened. A header we have accepted is evidence that its timestamp is in the
@@ -871,7 +875,7 @@
     ;;
     ;; `:resync` too, for the restart announcement, which is a different thing
     ;; and used to be spelled as a revert.
-    {:emits #{:broadcast :send :persist-then :set-timer :cancel-timer
+    {:emits #{:broadcast :send :persist-then :set-timer
               :commit :revert :resync :log}
      :topics #{:headers}})
 
@@ -904,7 +908,7 @@
                 ;; defines a `tick` event for exactly this and the simulator
                 ;; never delivers one, so a repeating timer is the only clock
                 ;; available to a node.
-                :now (or (:now config) (:time genesis))
+                :now (or (:unix-time config) (:now config) (:time genesis))
                 :seconds-per-tick (or (:seconds-per-tick config) 60)
                 :clock-ticks (or (:clock-ticks config) 1)
                 :announce-ticks (or (:announce-ticks config) 3)
@@ -912,7 +916,10 @@
                                        default-snapshot-interval)
                 :headers-since-snapshot 0}
           restored (:writes (:restored config))
-          state (if (seq restored) (anchor-clock (restore base restored)) base)
+          state (if (seq restored)
+                  (cond-> (restore base restored)
+                    (nil? (:unix-time config)) anchor-clock)
+                  base)
           chain (path-from state (:genesis state) (:tip state))]
       (n/result state
                 (concat [(n/set-timer :clock (:clock-ticks state))
@@ -929,7 +936,7 @@
                         ;; real revert safe could always be skipped. Nakamoto is
                         ;; the algorithm that genuinely revokes, so it is the one
                         ;; that most needs the two kept apart.
-                        (when (seq chain)
+                        (when (or (contains? config :restored) (seq chain))
                           [(n/resync chain)])))))
 
   (step [_ state input]
@@ -953,8 +960,9 @@
       :timer-fired
       (case (:timer-id input)
         :clock
-        (n/result (update state :now + (* (:clock-ticks state)
-                                          (:seconds-per-tick state)))
+        (n/result (if-some [now (:unix-time input)]
+                    (assoc state :now now)
+                    (update state :now + (* (:clock-ticks state) (:seconds-per-tick state))))
                   [(n/set-timer :clock (:clock-ticks state))])
 
         ;; Re-announce the tip periodically.

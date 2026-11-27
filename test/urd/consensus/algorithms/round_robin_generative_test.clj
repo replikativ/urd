@@ -85,10 +85,12 @@
 
 (defn gen-proposal-finalized-event
   "Generate a proposal-finalized event."
-  [proposal-ids]
+  [validator-ids]
   (gen/let [proposal gen-proposal
-            height (gen-height)]
+            height (gen-height)
+            sender (gen/elements validator-ids)]
     {:type :proposal-finalized
+     :sender sender
      :proposal proposal
      :height height}))
 
@@ -99,7 +101,7 @@
    [[40 (gen-proposal-received-event validator-ids)]
     [30 (gen-vote-received-event validator-ids proposal-ids)]
     [20 (gen-timeout-event)]
-    [10 (gen-proposal-finalized-event proposal-ids)]]))
+    [10 (gen-proposal-finalized-event validator-ids)]]))
 
 (defn gen-event-sequence
   "Generate a sequence of events."
@@ -141,6 +143,7 @@
             ;; Finalization event
             finalize-event (gen/return
                             {:type :proposal-finalized
+                             :sender (first validator-ids)
                              :proposal proposal
                              :height height})]
 

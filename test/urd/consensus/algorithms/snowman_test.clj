@@ -28,7 +28,6 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [urd.consensus.node :as n]
-            [urd.consensus.pending :as pending]
             [urd.consensus.rng :as rng]
             [urd.consensus.sim :as sim]
             [urd.consensus.algorithms.snowflake :as sf]
@@ -93,6 +92,14 @@
   (assoc params :termination-conditions go-termination-conditions))
 
 (defn- sf-of [] (sf/snowflake multi-params :red))
+
+(deftest termination-conditions-can-be-configured-in-any-order
+  (let [ps (assoc params :termination-conditions [{:alpha-confidence 5 :beta 3}
+                                                  {:alpha-confidence 3 :beta 2}])
+        sf (sf/snowflake ps :x)
+        once (sf/snowflake-record-poll sf 3 :x)]
+    (is (= [0 1] (:confidence once)))
+    (is (:finalized? (sf/snowflake-record-poll once 3 :x)))))
 
 (deftest a-multi-condition-instance-has-one-counter-per-condition
   (testing "the shape claim itself. Before `termination-conditions` was made
@@ -554,12 +561,11 @@
           st (:state (feed st (n/sampled 100 {:p1 3 :p2 1})))
           ;; B: uniform, completed.
           r (poll-all st 101 sample-peers :x)
-          r2 (poll-all (:state r) 102 sample-peers :x)]
-      (is (= 1 (count (:commits r2)))
-          "B reached beta over two honest uniform polls")
-      ;; If :weights leaked, B's first poll would already have counted 6 votes
-      ;; and both tallies would still pass -- so pin the tally itself.
-      (is (= 4 (reduce + 0 (vals {:p1 1 :p2 1 :p3 1 :p4 1})))))))
+          r2 (poll-all (:state r) 102 sample-peers :x)
+          drained (feed (:state r2) (n/timer-fired [:poll-expire 100]))]
+      (is (empty? (:commits r2)) "the earlier incomplete poll holds both results")
+      (is (= [:x] (mapcat #(:vertices (n/effect-params %))
+                          (filter #(= :commit (n/effect-kind %)) (:effects drained))))))))
 
 (deftest a-chit-is-attributed-to-its-authenticated-sender
   (testing "the chit's sender is `(:from input)`, the transport-authenticated
@@ -643,8 +649,7 @@
             silent forever, so that peer is in EVERY sample. Under the old
             rule every poll expired recording nothing and the node never
             finalized anything at all."
-    (let [live (butlast sample-peers)
-          dead (last sample-peers)]
+    (let [live (butlast sample-peers)]
       (loop [st (-> (start unit-params)
                     (add-blocks [{:id :x :parent :genesis :height 1}]))
              round 0]
@@ -652,6 +657,7 @@
           (is (contains? (:accepted st) :x)
               "the live majority finalizes despite the silent peer")
           (let [rid (:next-request st)
+                st (:state (feed st (n/timer-fired :poll)))
                 st (:state (feed st (n/sampled rid (zipmap sample-peers (repeat 1)))))
                 st (reduce (fn [s p]
                              (:state (feed s (n/message-received
@@ -679,55 +685,80 @@
       (is (= {:p1 :x} (get-in st [:outstanding 100 :chits]))
           "the second chit from the same peer is ignored"))))
 
-(deftest a-chit-naming-an-unknown-block-is-fetched-and-applied-later
-  (testing "LIVENESS. The chit used to be dropped along with any hope of
-            obtaining the block, so a node that missed one delivery was
-            stranded at that height permanently while still being sampled --
-            dead weight in every poll. avalanchego SendGets the block from the
-            peer that named it and schedules the vote against it."
-    (let [st (-> (start unit-params)
-                 (add-blocks [{:id :x :parent :genesis :height 1}]))
-          st (:state (feed st (n/sampled 100 (zipmap sample-peers (repeat 1)))))
-          ;; :p1 names a block we have never seen.
-          {st :state fx :effects}
-          (feed st (n/message-received :p1 {:kind :chit :request-id 100
-                                            :preference :unknown} #{:p1}))
-          st (reduce (fn [s p]
-                       (:state (feed s (n/message-received
-                                        p {:kind :chit :request-id 100 :preference :x}
-                                        #{p}))))
-                     st (rest sample-peers))
-          asks (->> (concat fx []) (filter #(= :send (n/effect-kind %))))]
-      (is (zero? (count asks)) "nothing asked yet -- the poll is still open"))
-    ;; Drive a full poll where one peer names an unknown block.
-    (let [st (-> (start unit-params)
-                 (add-blocks [{:id :x :parent :genesis :height 1}]))
-          st (:state (feed st (n/sampled 100 (zipmap sample-peers (repeat 1)))))
-          st (reduce (fn [s p]
-                       (:state (feed s (n/message-received
-                                        p {:kind :chit :request-id 100
-                                           :preference (if (= p :p1) :ghost :x)}
-                                        #{p}))))
-                     st (butlast sample-peers))
-          {st :state fx :effects}
-          (feed st (n/message-received (last sample-peers)
-                                       {:kind :chit :request-id 100 :preference :x}
-                                       #{(last sample-peers)}))
-          gets (->> fx
-                    (filter #(= :send (n/effect-kind %)))
-                    (map #(:msg (n/effect-params %)))
-                    (filter #(= :get-block (:kind %))))]
-      (is (= 1 (count gets)) "the missing block is requested")
-      (is (= :ghost (:id (first gets))) "by id")
-      (is (pos? (pending/held (:deferred st))) "and the vote is held, not lost")
-      ;; The block arrives; the deferred vote is applied.
-      (let [after (:state (feed st (n/message-received
-                                    :p1 {:kind :block
-                                         :block {:id :ghost :parent :genesis :height 1}}
-                                    #{:p1})))]
-        (is (some? (get-in after [:blocks :ghost])) "the block landed")
-        (is (zero? (pending/held (:deferred after)))
-            "and the vote it was waiting on was released")))))
+(defn- chit [peer rid pref]
+  (n/message-received peer {:kind :chit :request-id rid :preference pref} #{peer}))
+
+(defn- fetches [res]
+  (into [] (comp (filter #(= :send (n/effect-kind %)))
+                 (map #(get-in (n/effect-params %) [:msg :id])))
+        (:effects res)))
+
+(deftest poll-results-follow-issuance-order
+  (let [s (-> (start unit-params)
+              (add-blocks [{:id :x :parent :genesis :height 1}
+                           {:id :y :parent :genesis :height 1}]))
+        s (reduce (fn [s rid] (:state (feed s (n/sampled rid {:p1 4})))) s [100 101 102])
+        finish (fn [order]
+                 (reduce (fn [s [rid pref]] (:state (feed s (chit :p1 rid pref)))) s order))
+        issued [[100 :x] [101 :y] [102 :x]]
+        forwards (finish issued)]
+    (is (= forwards (finish [(nth issued 1) (nth issued 2) (nth issued 0)])))
+    (is (= :genesis (:last-accepted forwards)))))
+
+(deftest poll-dependencies-retain-the-request-and-fetch-missing-ancestors
+  (let [s (-> (start unit-params)
+              (add-blocks [{:id :x :parent :genesis :height 1}]))
+        s (:state (feed s (n/sampled 100 {:p1 1 :p2 3})))
+        one (feed s (chit :p1 100 :tip))
+        s (:state (feed (:state one) (chit :p2 100 :x)))
+        two (poll s 101 {:p1 3 :p2 1} [[:p1 :tip] [:p2 :x]])
+        tip (feed (:state two) (n/message-received :p1 {:kind :block :block
+                                                        {:id :tip :parent :middle :height 3}}
+                                                   #{:p1}))
+        done (feed (:state tip) (n/vertex-received {:id :middle :parent :x :height 2}))]
+    (is (= [:tip] (fetches one)))
+    (is (empty? (:commits two)))
+    (is (= #{:middle} (set (fetches tip))))
+    (is (= :genesis (:last-accepted (:state tip))))
+    (is (= [:x] (mapcat #(:vertices (n/effect-params %))
+                        (filter #(= :commit (n/effect-kind %)) (:effects done)))))
+    (is (empty? (:outstanding (:state done))))))
+
+(deftest an-unrecognized-request-id-leaves-outstanding-polls-alone
+  (let [s (:state (feed (start unit-params) (n/sampled 100 {:p1 4})))]
+    (is (= s (:state (feed s (chit :p1 :unknown :x)))))))
+
+(deftest delayed-sampling-preserves-issuance-order
+  (let [s (-> (start (assoc unit-params :beta 1))
+              (add-blocks [{:id :x :parent :genesis :height 1}]))
+        s (:state (feed s (n/timer-fired :poll)))
+        s (:state (feed s (n/timer-fired :poll)))
+        s (:state (feed s (n/sampled 1 {:p1 4})))
+        s (:state (feed s (chit :p1 1 :x)))
+        done (:state (feed s (n/timer-fired [:poll-expire 0])))]
+    (is (= :genesis (:last-accepted s)))
+    (is (= :x (:last-accepted done)))
+    (is (= done (:state (feed done (n/sampled 0 {:p1 4})))))))
+
+(deftest deferred-dependency-eviction-leaves-the-other-weights-in-the-poll
+  (let [s (-> (start (assoc unit-params :beta 1))
+              (assoc :deferred-limit 1)
+              (add-blocks [{:id :x :parent :genesis :height 1}]))
+        first-poll (poll s 100 {:p1 1 :p2 3} [[:p1 :unknown] [:p2 :x]])
+        next-poll (poll (:state first-poll) 101 {:p1 4} [[:p1 :later]])]
+    (is (empty? (:commits first-poll)))
+    (is (= :x (:last-accepted (:state next-poll))))
+    (is (= {:p1 :later} (get-in next-poll [:state :outstanding 101 :waiting])))))
+
+(deftest unresolved-votes-expire-once
+  (let [s (-> (start unit-params)
+              (add-blocks [{:id :x :parent :genesis :height 1}]))
+        p (poll s 100 {:p1 3 :p2 1} [[:p1 :x] [:p2 :missing]])
+        s (:state (feed (:state p) (n/timer-fired [:poll-expire 100])))
+        s (:state (feed s (n/vertex-received {:id :missing :parent :x :height 2})))]
+    (is (= :genesis (:last-accepted s)))
+    (is (empty? (:outstanding s)))
+    (is (= :x (:last-accepted (:state (poll-all s 101 sample-peers :x)))))))
 
 (deftest a-block-whose-parent-has-not-arrived-yet-is-held
   (testing "blocks reach us over a reordering network, so a child arriving before

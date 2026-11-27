@@ -304,6 +304,7 @@
 
           {:keys [state effects]} (handle-event sm state
                                                 {:type :proposal-finalized
+                                                 :sender validator-b
                                                  :proposal test-proposal
                                                  :height 0})]
 
@@ -911,6 +912,7 @@
                           :current-proposal ours
                           :current-proposal-id (:snapshot-id ours)))
           r (handle-event sm held {:type :proposal-finalized
+                                   :sender validator-b
                                    :proposal theirs
                                    :height 0})]
       (is (= 0 (:height (:state r))) "we do not advance on someone else's claim")
@@ -1122,7 +1124,7 @@
         (is (= s0 (:state (send {:kind :vote-bundle :proposal-id :p
                                  :votes (vec (repeat 20000 {:voter validator-b}))})))))
       (testing "but a well-formed message is still processed"
-        (let [r (send {:kind :finalized :height 0 :proposal {:x 1}})]
+        (let [r (send {:kind :finalized :height 0 :proposal test-proposal})]
           (is (not= s0 (:state r))
               "or the guard is refusing everything, which passes every
                assertion above while breaking the algorithm outright"))))))
@@ -1181,3 +1183,23 @@
                                           :proposal {:snapshot-id :p1} :height 0 :round 0}))))
             "and a proposal that simply OMITS the digest is refused too, which
              is the bypass that makes absence-is-invalid the default")))))
+
+(deftest a-single-proposer-can-commit-without-loopback
+  (let [sm (rr/create {validator-a nil})
+        st (initial-state sm {:peer-id validator-a})
+        result (n/step sm st (n/value-ready test-proposal {:height 0}))]
+    (is (contains-effect? (:effects result) :commit))
+    (is (= 1 (:height (:state result))))
+    (is (= (:state result)
+           (:state (n/step sm (:state result) (n/value-ready test-proposal {:height 0})))))))
+
+(deftest synchronized-history-uses-the-same-membership-and-validity-rules
+  (let [sm (rr/create test-validators)
+        st (assoc (initial-state sm {:peer-id validator-a}) :valid-fn :accepted)
+        new-member (random-uuid)
+        proposal {:snapshot-id :good :accepted true :validator-updates [{:id new-member :power 1}]}
+        direct (:state (rr/handle-finalization st proposal 0))
+        synced (:state (rr/handle-state-sync-response st {0 proposal 1 {:snapshot-id :invalid}} 2 0))]
+    (is (= 1 (:height synced)))
+    (is (contains? (:validator-set synced) new-member))
+    (is (= (:validator-set direct) (:validator-set synced)))))

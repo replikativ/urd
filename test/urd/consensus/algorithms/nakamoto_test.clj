@@ -1102,3 +1102,24 @@
           "whereas re-deriving from the same headers picks branch B. This is
            the assertion that fails if `::tip` stops being carried -- and it
            needs a tie to exist at all, which no other test here has"))))
+
+(deftest recovery-to-genesis-resynchronizes-the-consumer
+  (let [{:keys [effects]} (n/init (nk/create) {:peer-id :a :genesis test-genesis
+                                               :params easy-params :restored {:writes []}})
+        resets (filter #(= :resync (n/effect-kind %)) effects)]
+    (is (= [[]] (mapv #(:vertices (n/effect-params %)) resets)))))
+
+(deftest a-runtime-clock-event-carries-real-seconds
+  (let [node (nk/create)
+        st (:state (n/init node {:peer-id :a :params easy-params :genesis test-genesis
+                                 :unix-time 2000000000}))
+        tick (assoc (n/timer-fired :clock) :unix-time 2000000001)]
+    (is (= 2000000001 (:now (:state (n/step node st tick)))))))
+
+(deftest a-repeated-orphan-keeps-its-arrival-order
+  (let [st (scratch)
+        [_ [_ child]] (build st (:tip st) 2 :orphan)
+        parked (:state (nk/process-header st child :b))
+        repeat-result (nk/process-header parked (assoc child :transport-tag 1) :b)]
+    (is (= parked (:state repeat-result)))
+    (is (= [:send] (map n/effect-kind (:effects repeat-result))))))

@@ -371,7 +371,7 @@
       :request-value
       (let [value-fn (get-in sim [:config :value-fn])
             v (if value-fn (value-fn sim peer-id (:context params)) {:payload :none})]
-        (deliver-local sim peer-id (node/value-ready v)))
+        (deliver-local sim peer-id (node/value-ready v (:context params))))
 
       :log
       (update sim :trace conj (assoc params :tick (:tick sim) :peer peer-id))

@@ -219,19 +219,12 @@
 (defn- feed
   "Drive one node with `certs` in the given order; return the committed sequence."
   [validators stake certs]
-  (let [{st :state} (n/init (bs/create) {:sign-vote (:sign-vote (bs/test-attestations))
-                                         :verify-vote (:verify-vote (bs/test-attestations))
-                                         :peer-id (first validators)
-                                         :validators validators
-                                         :stake stake
-                                         :anchor-fn bs/stake-weighted-anchor})]
-    (loop [st st, queue (vec certs), out []]
-      (if (empty? queue)
-        out
-        (let [{st' :state fx :effects} (n/step (bs/create) st (n/vertex-received (first queue)))
-              committed (mapcat #(:vertices (n/effect-params %))
-                                (filter #(= :commit (n/effect-kind %)) fx))]
-          (recur st' (subvec queue 1) (into out committed)))))))
+  (let [peer (first validators)
+        s (sim/make {:nodes {peer (bs/create)}
+                     :node-config {peer (merge (bs/test-attestations)
+                                               {:validators validators :stake stake})}})
+        fed (reduce #(sim/inject %1 peer (n/vertex-received %2)) s certs)]
+    (sim/committed (sim/advance fed) peer)))
 
 (defspec ordering-is-arrival-order-independent 60
   (testing "the same certificates delivered in five different orders
@@ -252,22 +245,39 @@
                                   orders)]
                     (= 1 (count (distinct runs)))))))
 
-(deftest the-arrival-order-scenarios-are-not-mostly-empty
-  (testing "five runs that all commit NOTHING are identical too, so the property
-            above holds for an implementation that never orders anything.
+(deftest arrival-order-driver-delivers-a-known-commit
+  (let [st (bt/dag-through 3 {:anchor-fn bs/stake-weighted-anchor})
+        certs (mapcat vals (vals (into (sorted-map) (:dag st))))
+        expected (mapv bs/vertex (incremental st))]
+    (is (seq expected))
+    (is (= expected (feed (:validators st) (:stake st) (reverse certs))))))
 
-            The guard cannot go inside the property: a generated DAG whose
-            anchor author happened not to produce a certificate legitimately
-            commits nothing, and `gen-authors` picks a random quorum subset each
-            round, so that is a scenario the generator is supposed to produce.
-            What has to be true is that it is not the USUAL case. Measured here
-            over a fixed sample rather than asserted per case."
-    (let [samples (gen/sample gen-scenario 40)
-          nonempty (count (filter seq (map incremental samples)))]
-      (is (> nonempty (quot (count samples) 2))
-          (str "only " nonempty " of " (count samples)
-               " generated DAGs commit anything -- the arrival-order property is
-                mostly comparing empty sequences")))))
+(deftest delayed-ancestor-crossing-a-commit-watermark
+  (let [vs bt/vs
+        author (bs/stake-weighted-anchor 2 vs bt/uniform)
+        other (first (remove #{author} vs))
+        ;; The round-2 anchor and its supporting round-3 certificates need
+        ;; neither the author's round-1 block nor the other validator's round-2 block.
+        ;; A fourth branch carries both forward into the round-4 anchor.
+        headers (reduce (fn [st [r a]]
+                          (let [parents (cond
+                                          (and (= r 2) (not= a other)) (remove #{author} vs)
+                                          (and (= r 3) (not= a other)) (remove #{other} vs)
+                                          :else vs)]
+                            (bt/cert-in st a r (bt/ids-at st (dec r) parents))))
+                        (bt/state {})
+                        (for [r (range 1 6) a vs] [r a]))
+        certs (for [r (range 1 6) a vs] (get-in headers [:dag r a]))
+        early (for [r (range 1 4) a vs
+                    :when (not= a (if (= r 1) author other))]
+                (get-in headers [:dag r a]))
+        delayed (get-in headers [:dag 1 author])
+        on-time (feed vs bt/uniform certs)
+        late (feed vs bt/uniform (concat early (remove (set early) certs)))]
+    (is (seq (feed vs bt/uniform early)))
+    (is (= on-time late))
+    (is (not-any? #(= (:id delayed) (:id %)) late))
+    (is (some #(= 4 (:round %)) late))))
 
 ;; ============================================================
 ;; The live network

@@ -78,9 +78,8 @@
   ## Three mechanisms stop the DFS, and all three are needed
 
   1. `already-queued` dedups within one flatten;
-  2. `last-committed[author] == cert-round` -- STRICT equality, not `>=`;
-  3. the GC in `record-committed`, which removes everything strictly below that
-     frontier so the equality test is sufficient.
+  2. each author's committed watermark stops the walk at or below it;
+  3. GC and live insertion keep certificates below that watermark out of the DAG.
 
   The bootstrap case falls out of (2): `last-committed` starts at 0 for EVERY
   validator, and genesis certificates are at round 0, so the DFS stops there and
@@ -124,7 +123,7 @@
 (defn quorum-threshold
   "2f+1: `2 * total / 3 + 1`, integer division."
   [total]
-  (inc (quot (* 2 total) 3)))
+  (n/byzantine-threshold total))
 
 (defn validity-threshold
   "f+1: `(total + 2) / 3`, integer division -- i.e. ceil(total/3)."
@@ -345,7 +344,7 @@
   - a LIFO buffer, so the walk is a pre-order DFS;
   - parents visited in sorted digest order, so the DFS is deterministic;
   - a vertex is skipped if already queued here, or if this author's last
-    committed round EQUALS that round (strict equality; the GC handles below);
+    committed round equals or exceeds that round;
   - a parent missing from the DAG is skipped, not an error -- it was already
     committed and pruned, or garbage collected;
   - vertices more than `gc-depth` below the last committed round are dropped;
@@ -371,8 +370,7 @@
               (reduce (fn [[st q] d]
                         (if-let [c (cert-at dag pr d)]
                           (if (or (contains? q d)
-                                  (= (get last-committed (cert-author c))
-                                     (cert-round c)))
+                                  (<= (cert-round c) (get last-committed (cert-author c) 0)))
                             [st q]
                             [(conj st c) (conj q d)])
                           [st q]))
@@ -622,6 +620,7 @@
   order that happens to succeed."
   [state c]
   (and (map? (:header c))
+       (map? (:votes c))
        (int? (cert-round c))
        (not (neg? (cert-round c)))
        (contains? (:stake state) (cert-author c))
@@ -888,7 +887,8 @@
           ;; A certificate older than the GC horizon is archived and no more:
           ;; re-inserting it would put a vertex into a round the ordering layer
           ;; has already walked past.
-          state (if (< (+ r (:gc-depth state)) (:last-committed-round state))
+          state (if (or (< (+ r (:gc-depth state)) (:last-committed-round state))
+                        (< r (get (:last-committed state) (cert-author c) 0)))
                   state
                   (assoc-in state [:dag r (cert-author c)] c))
           {state :state fx1 :effects} (deliver-commits state r)
@@ -959,14 +959,15 @@
         prev (get-in state [:voted slot])
         ;; The attestation is what makes this vote worth anything to a node
         ;; that did not receive it from us. See `certified?`.
-        reply (n/send-to from {:kind :vote :from (:peer-id state)
-                               :header-id hid :round (:round header)
-                               :author (:author header)
-                               :att ((:sign-vote state) (:peer-id state) hid)})]
+        reply #(n/send-to from {:kind :vote :from (:peer-id state)
+                                :header-id hid :round (:round header)
+                                :author (:author header)
+                                :att ((:sign-vote state) (:peer-id state) hid)})]
     (cond
       ;; A retransmission. Re-answer: a lost vote otherwise stalls the author
       ;; forever, which is the failure Tendermint recorded under message loss.
-      (= prev hid) (n/result state [reply])
+      (= prev hid) (n/result state (when-not (contains? (:pending-votes state) slot)
+                                     [(reply)]))
 
       prev
       (n/result (update-in state [:rejected :equivocation] (fnil inc 0))
@@ -976,11 +977,11 @@
                    :first prev :second hid})])
 
       :else
-      (n/result (assoc-in state [:voted slot] hid)
+      (n/result (-> state (assoc-in [:voted slot] hid) (update :pending-votes conj slot))
                 [(n/persist-then {:writes {[:voted slot] hid}
                                   :durable? true
                                   :token [:voted slot]
-                                  :then [reply]})]))))
+                                  :then [(reply)]})]))))
 
 (defn- receive-header
   [state header from]
@@ -1044,6 +1045,7 @@
   (let [own (get-in state [:own-headers round])]
     (if (or (nil? own)
             (not= header-id (:id own))
+            (contains? (:pending-votes state) [(:peer-id state) round])
             (contains? (:certified state) round)
             ;; A vote we cannot verify is a vote we cannot pass on. We are
             ;; about to aggregate these into a certificate that peers will
@@ -1185,6 +1187,7 @@
                        :verify-vote verify-vote
                        :round 1
                        :voted {}
+                       :pending-votes #{}
                        :pending {}
                        ;; Headers waiting on a parent certificate we have
                        ;; asked for. Bounded by round-age and by count: an
@@ -1329,6 +1332,9 @@
                                     "in-place update.")
                        :updates (:validator-updates (:value input))})])
 
+          (contains? (:pending-votes state) slot)
+          (n/result state)
+
           ;; Already proposed for this round -- possibly in a previous life, if
           ;; this header came back off disk. Re-announce it; do not build a new
           ;; one, because a new parent set gives a new digest and that is a
@@ -1365,13 +1371,14 @@
                           ;; toward our own quorum.
                           (assoc-in [:votes round]
                                     {(:peer-id state) ((:sign-vote state) (:peer-id state) hid)})
-                          (assoc-in [:voted slot] hid))]
+                          (assoc-in [:voted slot] hid)
+                          (update :pending-votes conj slot))]
             (n/result state
                       [(n/persist-then
                         {:writes {[:voted slot] hid
                                   [:proposed round] header}
                          :durable? true
-                         :token [:header round]
+                         :token [:voted slot]
                          :then [(announce header)]})]))))
 
       :message-received
@@ -1444,7 +1451,8 @@
           (n/result state
                     (into []
                           (concat
-                           (when own
+                           (when (and own (not (contains? (:pending-votes state)
+                                                          [(:peer-id state) (:round state)])))
                              [(n/broadcast :bullshark {:kind :header
                                                        :header (:header own)
                                                        :from (:peer-id state)})])
@@ -1462,9 +1470,13 @@
                            [(n/set-timer :gossip (:gossip-ticks state))]))))
         (n/result state))
 
-      ;; Nothing is gated behind the certificate write, so there is nothing to
-      ;; release; the vote's `:then` is released by the interpreter.
-      :persisted (n/result state)
+      ;; The interpreter releases the first send after this completion.
+      ;; Later retransmissions may now release the same slot immediately.
+      :persisted
+      (let [token (:token input)]
+        (n/result (if (and (vector? token) (= :voted (first token)))
+                    (update state :pending-votes disj (second token))
+                    state)))
 
       :vertex-received (insert-certificate state (:vertex input))
 

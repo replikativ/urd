@@ -114,17 +114,9 @@
             [:c :externalize :a 3 [":a"] 11 [:a]]
             [:d :externalize :a 3 [":a"] 11 [:a]]]
            (fingerprint 12345 0.0 60))))
-  (testing "and a lossy one, where the retransmission timer is what saves it.
-
-           These counters moved when the ballot timer was fixed to re-arm after
-           a suppressed abandon: the timer used to die at the first suppression,
-           so under loss most nodes simply stopped timing out. 4294967295 is
-           UINT32_MAX, the counter a node bumps to when a v-blocking set is
-           already at EXTERNALIZE, and it is reachable only from PREPARE or
-           CONFIRM -- `update-current-value` refuses a bump once the phase is
-           EXTERNALIZE, so it cannot overflow from there."
-    (is (= [[:a :externalize :a 3 [":a"] 10 [:a]]
-            [:b :externalize :a 4294967295 [":a"] 12 [:a]]
-            [:c :externalize :a 3 [":a"] 13 [:a]]
-            [:d :externalize :a 3 [":a"] 11 [:a]]]
+  (testing "durable gossip replays without an extra persistence delay under packet loss"
+    (is (= [[:a :externalize :a 4 [":a"] 11 [:a]]
+            [:b :externalize :a 4294967295 [":a"] 13 [:a]]
+            [:c :externalize :a 4 [":a"] 14 [:a]]
+            [:d :externalize :a 4 [":a"] 12 [:a]]]
            (fingerprint 7 0.3 200)))))

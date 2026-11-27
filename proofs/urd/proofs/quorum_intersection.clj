@@ -37,17 +37,19 @@
 (a/defn quorum [n Nat] Nat
   (+ 1 (quot (* 2 n) 3)))
 
+;; Operands are natural numbers. Nat.sub truncates at zero, matching
+;; byzantine-tolerance's (max 0 (dec n)) at the boundary n=0.
 (a/defn tolerated [n Nat] Nat
-  (quot (- n 1) 3))
+  (quot (Nat.sub n 1) 3))
 
 ;; The shared members of two quorums: |A| + |B| - n, by inclusion-exclusion.
 (a/defn shared [n Nat] Nat
-  (- (* 2 (quorum n)) n))
+  (Nat.sub (* 2 (quorum n)) n))
 
 ;; ===================================================================
 ;; THE THEOREM: the members two quorums share are more than the faults
 ;; that can be tolerated -- so at least one of them is honest.
 ;; ===================================================================
 (a/theorem quorum-intersection [n :- Nat]
-  (= Bool (< (tolerated n) (shared n)) true)
-  (grind))
+  (< Nat (tolerated n) (shared n))
+  (omega))

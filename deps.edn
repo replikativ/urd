@@ -86,6 +86,7 @@
   ;;
   ;;   clj -M:cljs-test
   :cljs-test {:extra-paths ["test"]
+              :jvm-opts ["-Xss4m"]
               :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
                            org.clojure/test.check {:mvn/version "1.1.1"}}
               ;; BUILD a file. Do NOT `-m` through cljs.main.
@@ -148,12 +149,9 @@
   ;; `sim.cljc` is the NETWORK simulator, complementing kabel, and konserve's
   ;; is the STORAGE one, complementing a real backend.
   ;;
-  ;; A local root for the same reason `:ledger` needs one -- the simulation
-  ;; namespaces are not in a released konserve (checked: absent from 0.9.372).
-  ;;
-  ;;   clj -M:storage-sim
+  ;; The fault-injection APIs ship in Konserve 0.9.399.
   :storage-sim {:extra-paths ["test" "test-storage" "test/resources"]
-                :extra-deps {org.replikativ/konserve {:local/root "../konserve"}
+                :extra-deps {org.replikativ/konserve {:mvn/version "0.9.399"}
                              io.github.cognitect-labs/test-runner
                              {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                              org.clojure/test.check {:mvn/version "1.1.1"}}
@@ -181,18 +179,10 @@
   ;;
   ;;   clj -M:proofs
   ;;
-  ;; Needs ansatz's Boolean simp set, which landed in 0.2.84
-  ;; (replikativ/ansatz#70). On 0.2.82 every theorem failed with
-  ;; `grind: all strategies failed` -- Lean's Bool `@[simp]` lemmas were largely
-  ;; absent from the bundled store and simp oscillated forever between two
-  ;; orientations of a Bool equality. 0.2.84 loads 3653 Init declarations and
-  ;; proves all five.
-  ;;
-  ;; `quorum-intersection` is stated with `quot`, which ansatz#71 lifted for
-  ;; the same reason it declines to lift `/`: Clojure's `/` is Ratio division,
-  ;; and a verified definition must mean what the Clojure it erases to means.
+  ;; The proof alias uses the bundled Init tier and the omega tactic for
+  ;; symbolic natural-number division in the quorum bound.
   :proofs {:extra-paths ["proofs"]
-           :extra-deps {org.replikativ/ansatz {:mvn/version "0.2.84"}
+           :extra-deps {org.replikativ/ansatz {:mvn/version "0.2.654"}
                         metosin/malli {:mvn/version "0.16.4"}
                         io.github.cognitect-labs/test-runner
                         {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
