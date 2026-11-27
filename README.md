@@ -55,7 +55,7 @@ real one.
 ## Installation
 
 ```clojure
-org.replikativ/urd {:mvn/version "RELEASE"}
+org.replikativ/urd {:mvn/version "0.1.19"}
 ```
 
 ## Quick start
@@ -211,5 +211,4 @@ Bitcoin: [Nakamoto](https://bitcoin.org/bitcoin.pdf)
 
 ## License
 
-Copyright © 2026 Christian Weilbach. Distributed under the Eclipse Public
-License 2.0.
+Copyright © 2026 Christian Weilbach. Distributed under the [Apache License 2.0](LICENSE).

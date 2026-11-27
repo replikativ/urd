@@ -1,15 +1,5 @@
 version: 2.1
 
-# What CI runs: `:test` (650 tests, `^:integration` excluded), `:integration`
-# (real sockets), `:cljs-test` (built to a file, then run under node), and
-# `:format`.
-#
-# Storage fault injection runs against the Konserve version in :storage-sim.
-#
-# The ledger suites used to be excluded here for the same reason. They are now
-# in ../skuld, where they are that project's own gate rather than an
-# exclusion note in this one.
-
 orbs:
   tools: replikativ/clj-tools@0
 
@@ -35,6 +25,7 @@ workflows:
           requires:
             - tools/setup
       - test-storage:
+          context: docker-deploy
           requires:
             - tools/setup
       - test-proofs:
@@ -72,11 +63,10 @@ workflows:
 
 jobs:
   test-consensus:
-    docker:
-      - image: cimg/clojure:1.12
-    working_directory: ~/repo
+    executor: tools/clojurecli
     steps:
-      - checkout
+      - attach_workspace:
+          at: /home/circleci
       - run:
           name: Download dependencies
           command: clojure -P -M:test
@@ -97,11 +87,10 @@ jobs:
   # (replikativ/ansatz#70). Before that every theorem failed with
   # `grind: all strategies failed` on the released version.
   test-proofs:
-    docker:
-      - image: cimg/clojure:1.12
-    working_directory: ~/repo
+    executor: tools/clojurecli
     steps:
-      - checkout
+      - attach_workspace:
+          at: /home/circleci
       - run:
           name: Download dependencies
           command: clojure -P -M:proofs
@@ -110,11 +99,10 @@ jobs:
           command: clojure -M:proofs
 
   test-storage:
-    docker:
-      - image: cimg/clojure:1.12
-    working_directory: ~/repo
+    executor: tools/clojurecli
     steps:
-      - checkout
+      - attach_workspace:
+          at: /home/circleci
       - run: clojure -M:storage-sim
 
   # The real-network tests: four validators over actual websockets. Separate
@@ -123,11 +111,10 @@ jobs:
   # commits in five wall-clock seconds and fails under contention while
   # clearing the bar several times over when it has the box to itself.
   test-integration:
-    docker:
-      - image: cimg/clojure:1.12
-    working_directory: ~/repo
+    executor: tools/clojurecli
     steps:
-      - checkout
+      - attach_workspace:
+          at: /home/circleci
       - run:
           name: Download dependencies
           command: clojure -P -M:integration
@@ -142,11 +129,10 @@ jobs:
   # different delays, drops and sampled peers. It survived because every test
   # that could have caught it was `.clj`.
   test-cljs:
-    docker:
-      - image: cimg/clojure:1.12-node
-    working_directory: ~/repo
+    executor: tools/clojurecli
     steps:
-      - checkout
+      - attach_workspace:
+          at: /home/circleci
       - run:
           name: Download dependencies
           command: clojure -P -M:cljs-test

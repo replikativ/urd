@@ -1,17 +1,5 @@
 (ns build
-  "Build and publish urd.
-
-  Mirrors the rest of the replikativ stack (kabel, geheimnis, boring) so that
-  the release story is the same everywhere: version is `major.minor.<commit
-  count>`, the jar carries a pom with real SCM data, and `deploy` goes to
-  Clojars.
-
-  This namespace did not exist while `deps.edn` already declared
-  `:build {:ns-default build}` and CircleCI already chained
-  `build -> deploy -> release`. That chain therefore could never have run, and
-  urd has never been publishable -- which is worth stating rather than quietly
-  fixing, because the badge and the install snippet in the README both implied
-  otherwise."
+  "Build and publish Urd to Clojars."
   (:require [clojure.tools.build.api :as b]
             [deps-deploy.deps-deploy :as dd]))
 
@@ -32,6 +20,7 @@
 (defn jar [_]
   (let [v (version)
         jf (jar-file)]
+    (b/delete {:path class-dir})
     (b/write-pom {:class-dir class-dir
                   :lib lib
                   :version v
@@ -46,13 +35,11 @@
                              [:url "https://github.com/replikativ/urd"]
                              [:licenses
                               [:license
-                               ;; 2.0, matching `LICENSE`. The stack's older
-                               ;; build files say 1.0 and copying one would have
-                               ;; published a pom that contradicts the file in
-                               ;; the repository.
-                               [:name "Eclipse Public License 2.0"]
-                               [:url "https://www.eclipse.org/legal/epl-2.0/"]]]]})
+                               [:name "Apache License, Version 2.0"]
+                               [:url "https://www.apache.org/licenses/LICENSE-2.0"]]]]})
     (b/copy-dir {:src-dirs ["src"] :target-dir class-dir})
+    (b/copy-file {:src "LICENSE" :target (str class-dir "/META-INF/LICENSE")})
+    (b/copy-file {:src "NOTICE" :target (str class-dir "/META-INF/NOTICE")})
     (b/jar {:class-dir class-dir :jar-file jf})
     (println "JAR created:" jf)))
 
