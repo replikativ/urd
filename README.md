@@ -41,7 +41,7 @@ arithmetic. Each algorithm has its own deployment assumptions.
   `(assoc payload :id (tm/content-id payload))` and configure every validator
   with `:valid-fn (every-pred tm/valid-content-id? application-valid?)`,
   where `tm` names `urd.consensus.algorithms.tendermint`.
-- **Round-robin** is a crash-fault reference with volatile votes.
+- **Round-robin** is a crash-fault reference that persists its proposal, vote, and decisions.
 - **Nakamoto** implements header-chain selection and exposes reversible commits.
 - **Snowman**, **SCP** and **Bullshark** are reference implementations for
   protocol experiments and simulation.
@@ -117,10 +117,10 @@ earlier; prose about code drifts silently, and a test does not.
 |---|---|---|---|---|---|
 | **tendermint** | Byzantine | 2f+1 by **voting power** | yes | yes, at height+1 | deployment candidate |
 | **raft** | crash | majority, head count | yes | yes, joint consensus | deployment candidate (CFT) |
-| **round-robin** | crash | majority, head count | **no** | yes, next height | reference |
+| **round-robin** | crash | majority, head count | yes | yes, next height | reference |
 | **bullshark** | Byzantine | 2f+1 by **stake** | yes | refuses, loudly | reference-grade |
 | **scp** | Byzantine, federated | quorum slices | yes | n/a | reference-grade |
-| **snowman** | Byzantine, probabilistic | sampling (k/α/β) | no | no | protocol stress test |
+| **snowman** | Byzantine, probabilistic | weighted sampling (k/α/β) | accepted chain | no | protocol stress test |
 | **nakamoto** | open membership | cumulative work | yes | n/a | generality test |
 
 `snowtree` and `snowflake` are not algorithms in this sense — they are the
@@ -131,7 +131,7 @@ reference, is in [doc/algorithms.md](doc/algorithms.md).
 
 ## Documentation
 
-- [The Node protocol](doc/node-protocol.md) — pure `step`, thirteen effects,
+- [The Node protocol](doc/node-protocol.md) — pure `step`, effects,
   the durability barrier, capability declarations
 - [Algorithms](doc/algorithms.md) — the seven in depth, and where each departs
   from its paper or its reference implementation, with reasons

@@ -120,13 +120,13 @@
 ;; SIGNED 32-bit integer -- 0xffffffff >> 24 is -1 there, not 255.
 ;; ============================================================
 
-(defn compact-exponent [c] (quot c 16777216))
-(defn compact-mantissa [c] (mod c 8388608))
+(defn compact-exponent [c] (quot (long c) 16777216))
+(defn compact-mantissa [c] (mod (long c) 8388608))
 (defn compact-negative?
   "Bit 23. Bitcoin never needs a negative target, but bitcoind encodes the sign
   bit anyway, so a header can claim one and must be rejected for it."
   [c]
-  (odd? (quot c 8388608)))
+  (odd? (quot (long c) 8388608)))
 
 (defn compact->target
   "The magnitude of a compact target, as a bignat. Callers must check
@@ -221,6 +221,12 @@
        (u32? (:nonce header))
        (hash-hex? (:prev header))
        (hash-hex? (:merkle-root header))))
+
+(defn- canonical-header
+  "The six wire fields, with exactly integral host numbers normalized to integers."
+  [{:keys [version prev merkle-root time bits nonce]}]
+  {:version (long version) :prev prev :merkle-root merkle-root
+   :time (long time) :bits (long bits) :nonce (long nonce)})
 
 (defn- u32-le [n]
   (when (or (neg? n) (>= n 4294967296))
@@ -446,7 +452,7 @@
   [p state header parent-id]
   (let [expected (next-work-required p state parent-id)]
     (cond
-      (not= (:bits header) expected) :unexpected-difficulty
+      (not (== (:bits header) expected)) :unexpected-difficulty
       (<= (:time header) (median-time-past p state parent-id)) :time-too-old
       :else nil)))
 
@@ -531,20 +537,21 @@
   (let [old-tip (:tip state)
         fork (find-fork state old-tip new-tip)
         attach (path-from state fork new-tip)
-        detached? (not= fork old-tip)]
-    (n/result (assoc state :tip new-tip)
-              (concat (when detached?
+        detached (when (not= fork old-tip) (path-from state fork old-tip))
+        prefix (reduce (fn [chain _] (pop chain)) (:best-chain state) detached)]
+    (n/result (assoc state :tip new-tip :best-chain (into prefix attach))
+              (concat (when detached
                         ;; The detached path is named explicitly rather than
                         ;; left for the interpreter to search for: reverting to
                         ;; a vertex that was never committed -- genesis, where
                         ;; every reorg-to-root lands -- is otherwise
                         ;; indistinguishable from a mistyped id, and both would
                         ;; wipe committed history.
-                        [(n/revert fork (path-from state fork old-tip))
+                        [(n/revert fork detached)
                          (n/log-effect :info
                                        {:event :reorg
                                         :fork fork
-                                        :detached (count (path-from state fork old-tip))
+                                        :detached (count detached)
                                         :attached (count attach)})])
                       [(n/commit attach)]))))
 
@@ -553,9 +560,8 @@
 
   Returns {:state s :effects fx :status k} where status is :accepted,
   :duplicate, or a rejection keyword."
-  [state header]
-  (let [p (:params state)
-        id (header-id header)]
+  [state header id relay?]
+  (let [p (:params state)]
     (cond
       (blk state id)
       (assoc (n/result state) :status :duplicate)
@@ -570,7 +576,6 @@
               due? (>= (:headers-since-snapshot state)
                        (:snapshot-interval state default-snapshot-interval))
               state (cond-> state due? (assoc :headers-since-snapshot 0))
-              relay (n/broadcast :headers {:kind :header :header header})
               new? (bn/gt (:work-sum (blk state id)) (tip-work state))
               {state :state fx :effects} (if new?
                                            (reorg-effects state id)
@@ -594,14 +599,17 @@
                          :durable? true
                          :token id}
                          due? (assoc :checkpoint [(snapshot-record state)])))]
-          (assoc (n/result state (concat [persist relay] fx)) :status :accepted))))))
+          (assoc (n/result state (into (cond-> [persist]
+                                         relay? (conj (n/broadcast :headers {:kind :header :header header})))
+                                       fx))
+                 :status :accepted))))))
 
 (defn- drain-orphans
   "Connect any orphans that the newly-connected block is the parent of.
 
   A fixpoint rather than a single pass: connecting one orphan can unlock the
   next, which is how a whole competing branch delivered out of order lands."
-  [state id]
+  [state id relay?]
   (loop [state state, pending [id], acc []]
     (if (empty? pending)
       (n/result state acc)
@@ -614,11 +622,12 @@
           (recur state (rest pending) acc)
           (let [[state acc unlocked]
                 (reduce (fn [[st acc unlocked] h]
-                          (let [r (connect-one st h)]
+                          (let [kid-id (header-id h)
+                                r (connect-one st h kid-id relay?)]
                             [(:state r)
                              (into acc (:effects r))
                              (if (= :accepted (:status r))
-                               (conj unlocked (header-id h))
+                               (conj unlocked kid-id)
                                unlocked)]))
                         [state acc []]
                         ;; SORTED. The orphan pool is a set, and set iteration
@@ -676,6 +685,73 @@
       (let [oldest (first (sort-by (comp :seq val) (:orphan-at state)))]
         (cond-> state oldest (forget-orphan (key oldest)))))))
 
+(def ^:private header-batch-limit 128)
+(def ^:private locator-limit 64)
+
+(defn- parent-request [state peer orphan-id parent]
+  (let [chain (:best-chain state)
+        cursor (get-in state [:orphan-at orphan-id :cursor])
+        ;; Exactly the dense tip and exponentially spaced history used by
+        ;; btcd chainView.blockLocator. The cursor can be on a side branch
+        ;; that has yet to exceed our incumbent's work.
+        locator (loop [h (dec (count chain)), step 1, out []]
+                  (let [out (conj out (nth chain h))]
+                    (if (zero? h)
+                      out
+                      (recur (max 0 (- h step)) (if (> (count out) 10) (* 2 step) step) out))))]
+    (n/send-to peer {:kind :get-header :id parent :for orphan-id
+                     :locator (if cursor (into [cursor] (remove #{cursor}) locator) locator)})))
+
+(defn- main-height [state id]
+  (when-let [h (height state id)]
+    (when (= id (get (:best-chain state) h)) h)))
+
+(defn- answer-header-request [state peer {:keys [id locator] orphan-id :for}]
+  (if-let [b (blk state id)]
+    (let [stop (main-height state id)
+          common (when (and stop (hash-hex? orphan-id) (vector? locator)
+                            (<= 1 (count locator) locator-limit) (every? hash-hex? locator))
+                   (some #(main-height state %) locator))
+          reply (if (and common (< common stop))
+                  (let [start (inc common)
+                        end (min (inc stop) (+ start header-batch-limit))
+                        ids (subvec (:best-chain state) start end)]
+                    {:kind :header-batch :for orphan-id
+                     :headers (mapv #(:header (blk state %)) ids)})
+                  {:kind :header :header (:header b)})]
+      (n/result state [(n/send-to peer reply)]))
+    (n/result state)))
+
+(defn- connect-and-drain [state header id relay?]
+  (let [r (connect-one state header id relay?)]
+    (if (= :accepted (:status r))
+      (let [d (drain-orphans (:state r) id relay?)]
+        (n/result (:state d) (into (vec (:effects r)) (:effects d))))
+      (n/result (:state r) (:effects r)))))
+
+(defn- receive-header-batch [state peer {headers :headers orphan-id :for}]
+  (let [{:keys [parent cursor requested-from]} (get-in state [:orphan-at orphan-id])]
+    (if-not (and parent peer (= peer requested-from) (vector? headers) (<= 1 (count headers) header-batch-limit)
+                 (every? map? headers) (blk state (:prev (first headers))))
+      (n/result state)
+      (loop [st state, previous (:prev (first headers)), remaining (seq headers), effects []]
+        (if-let [h (first remaining)]
+          (if (and (well-formed? h) (= previous (:prev h)))
+            (let [h (canonical-header h)
+                  id (header-id h)
+                  result (connect-and-drain st h id false)
+                  effects (into effects (:effects result))]
+              (if (and (blk (:state result) id) (contains? (:orphan-at (:state result)) orphan-id))
+                (recur (:state result) id (next remaining) effects)
+                (n/result (:state result) effects)))
+            (n/result st effects))
+          (if (and (= (count headers) header-batch-limit)
+                   (contains? (:orphan-at st) orphan-id)
+                   (not= previous cursor))
+            (let [st (assoc-in st [:orphan-at orphan-id :cursor] previous)]
+              (n/result st (conj effects (parent-request st peer orphan-id parent))))
+            (n/result st effects)))))))
+
 (defn process-header
   "The whole acceptance path -- `ProcessBlockHeader` / `maybeAcceptBlockHeader`.
 
@@ -686,18 +762,14 @@
     ;; Checked before anything hashes it; see `well-formed?`.
     (n/result (update-in state [:rejected :malformed] (fnil inc 0))
               [(n/log-effect :warn {:event :malformed-header :from from})])
-    (let [header (select-keys header [:version :time :bits :nonce :prev :merkle-root])
+    (let [header (canonical-header header)
           id (header-id header)]
       (cond
         (blk state id)
         (n/result state)
 
         (blk state (:prev header))
-        (let [r (connect-one state header)]
-          (if (= :accepted (:status r))
-            (let [d (drain-orphans (:state r) id)]
-              (n/result (:state d) (concat (:effects r) (:effects d))))
-            (n/result (:state r) (:effects r))))
+        (connect-and-drain state header id true)
 
         ;; Unknown parent, and the CONTEXT-FREE checks fail: refuse outright.
         ;;
@@ -734,7 +806,10 @@
                                         :from from})])
 
         (contains? (:orphan-at state) id)
-        (n/result state (when from [(n/send-to from {:kind :get-header :id (:prev header)})]))
+        (if from
+          (n/result (assoc-in state [:orphan-at id :requested-from] from)
+                    [(parent-request state from id (:prev header))])
+          (n/result state))
 
         ;; Unknown parent, but the work is real: park it, and ask whoever sent
         ;; it for the parent.
@@ -743,10 +818,11 @@
           (n/result (-> state
                         (update-in [:orphans (:prev header)] (fnil conj #{}) header)
                         (assoc-in [:orphan-at id] {:seq (:orphan-seq state 0)
-                                                   :at (:now state)})
+                                                   :at (:now state) :parent (:prev header)
+                                                   :requested-from from})
                         (update :orphan-seq (fnil inc 0)))
                     (when from
-                      [(n/send-to from {:kind :get-header :id (:prev header)})])))))))
+                      [(parent-request state from id (:prev header))])))))))
 
 ;; ============================================================
 ;; Mining -- TEST ONLY
@@ -799,7 +875,8 @@
 (defn- index-restored
   "Index one durable header, moving the tip if it now carries the most work."
   [st h]
-  (let [id (header-id h)]
+  (let [h (canonical-header h)
+        id (header-id h)]
     (if (or (blk st id) (nil? (blk st (:prev h))))
       st
       (let [st (index-block st id h)]
@@ -884,6 +961,9 @@
           genesis (:genesis config)
           _ (when-not genesis
               (throw (ex-info "nakamoto needs a :genesis header in config" {})))
+          _ (when-not (well-formed? genesis)
+              (throw (ex-info "nakamoto needs a well-formed genesis header" {})))
+          genesis (canonical-header genesis)
           gid (header-id genesis)
           base {:peer-id (:peer-id config)
                 ;; No `:peers`. It was written here and read nowhere: gossip
@@ -921,7 +1001,7 @@
                     (nil? (:unix-time config)) anchor-clock)
                   base)
           chain (path-from state (:genesis state) (:tip state))]
-      (n/result state
+      (n/result (assoc state :best-chain (into [gid] chain))
                 (concat [(n/set-timer :clock (:clock-ticks state))
                          (n/set-timer :announce (:announce-ticks state))]
                         ;; `resync`, not a revert. On restart we do not know
@@ -946,15 +1026,12 @@
       (process-header state (:vertex input) nil)
 
       :message-received
-      (let [{:keys [kind header id]} (:msg input)]
+      (let [{:keys [kind header] :as msg} (:msg input)]
         (case kind
           :header (process-header state header (:from input))
           ;; A peer is missing a header we have; send it back.
-          :get-header
-          (if-let [b (blk state id)]
-            (n/result state [(n/send-to (:from input)
-                                        {:kind :header :header (:header b)})])
-            (n/result state))
+          :get-header (answer-header-request state (:from input) msg)
+          :header-batch (receive-header-batch state (:from input) msg)
           (n/result state)))
 
       :timer-fired
@@ -971,10 +1048,8 @@
         ;; it: two halves of a partition each broadcast their branch into a
         ;; black hole, and after healing NEITHER re-announced, so a network that
         ;; had already forked never reconverged. Bitcoin has the same problem
-        ;; and solves it with an inv/getheaders handshake on connect; the same
-        ;; effect is had here by re-broadcasting the tip, since a peer that does
-        ;; not know it parks it and walks backwards to the fork point one
-        ;; `get-header` at a time.
+        ;; and solves it with inv/getheaders. Here an unknown tip prompts
+        ;; a locator request; receiving the tip again retries a lost page.
         :announce
         (n/result state
                   [(n/broadcast :headers

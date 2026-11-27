@@ -43,8 +43,8 @@
             [urd.consensus.store :as store]
             [urd.consensus.auth :as auth]
             [urd.consensus.rng :as rng]
-            #?(:clj [clojure.core.async :refer [chan timeout alt! close! >! <! <!! go put!]]
-               :cljs [clojure.core.async :refer [chan timeout alt! close! >! <! put! go]])
+            #?(:clj [clojure.core.async :refer [chan promise-chan timeout alt! close! >! <! <!! go put! take!]]
+               :cljs [clojure.core.async :refer [chan promise-chan timeout alt! close! >! <! put! take! go]])
             [superv.async :refer [go-try- <?-]])
   ;; `go` is referred in BOTH branches. It was in the `:clj` one only, while
   ;; `do-persist-then` calls it unconditionally, so this namespace did not
@@ -105,10 +105,30 @@
 ;; Effects
 ;; ============================================================
 
-(declare handle-loop-error!)
+(declare handle-loop-error! stop-runtime!)
 
 (defn- emit-event! [runtime event]
   (put! (:event-ch runtime) event))
+
+(defn- update-network-jobs! [runtime f]
+  (let [jobs (swap! (:network-jobs runtime) f)]
+    (when (and (:closed? jobs) (zero? (:active jobs)))
+      (close! (:network-drained runtime)))))
+
+(defn- network-job! [runtime work]
+  ;; Register synchronously before scheduling any IO. Closing admission and
+  ;; claiming a job are atomic with respect to each other.
+  (let [[previous _] (swap-vals! (:network-jobs runtime)
+                                 #(cond-> % (not (:closed? %)) (update :active inc)))]
+    (when-not (:closed? previous)
+      (let [finish (fn [_] (update-network-jobs! runtime #(update % :active dec)))]
+        (try
+          (if @(:running? runtime)
+            (take! (work) finish)
+            (finish nil))
+          (catch #?(:clj Exception :cljs :default) e
+            (finish nil)
+            (throw e)))))))
 
 (defn- do-broadcast
   "Sign, then send.
@@ -119,15 +139,18 @@
   sender could not have forged."
   ([runtime topic msg] (do-broadcast runtime topic msg nil))
   ([runtime topic msg to]
-   (go-try-
-    ;; The topic and the recipient go INTO the signature, not just onto the
-    ;; envelope beside it -- see `auth/digest`. Before this, a captured message
-    ;; could be re-delivered on another topic, or have its `:to` rewritten or
-    ;; stripped so that a message directed at one peer was accepted by all of
-    ;; them.
-    (let [envelope (<?- (auth/seal (:auth runtime) msg {:topic topic :to to}))]
-      (<?- (net/broadcast! (:network runtime) topic
-                           (assoc envelope :sender (:peer-id runtime))))))))
+   (network-job!
+    runtime
+    (fn []
+      (go-try-
+       (when-let [envelope (try
+                             (<?- (auth/seal (:auth runtime) msg {:topic topic :to to}))
+                             (catch #?(:clj Exception :cljs :default) e
+                               (handle-loop-error! runtime e)
+                               nil))]
+         (when @(:running? runtime)
+           (<?- (net/broadcast! (:network runtime) topic
+                                (assoc envelope :sender (:peer-id runtime)))))))))))
 
 (defn- do-send-to
   "Unicast, emulated over broadcast; see the namespace docstring.
@@ -249,6 +272,24 @@
 (defn- warn! [runtime & parts]
   (println "[" (:peer-id runtime) "] warn -" (apply str (interpose " " parts))))
 
+(defn- do-read-durable [runtime {ks :keys token :token}]
+  (network-job!
+   runtime
+   (fn []
+     (go
+       (let [values (try
+                      (<?- (store/fold (:store runtime)
+                                       (fn [found record]
+                                         (reduce-kv (fn [m k v]
+                                                      (if (contains? ks k) (assoc m k v) m))
+                                                    found (:writes record)))
+                                       {}))
+                      (catch #?(:clj Throwable :cljs :default) e
+                        (warn! runtime "durable lookup failed" (ex-message e))
+                        {}))]
+         (when @(:running? runtime)
+           (emit-event! runtime (n/durable-values token (or values {})))))))))
+
 (def persist-complete
   "Marks the internal event that carries a landed write back to the loop.
 
@@ -343,17 +384,17 @@
   Reseeding per draw rather than keeping a CSPRNG object threaded through the
   record keeps `rng`'s pure `[value next-rng]` contract intact; the cost is one
   host call per sample, against `k` network round trips."
-  [rng-atom candidates k]
+  [rng-atom candidates weight-fn k]
   (if rng-atom
     (loop []
       (let [r @rng-atom
-            [bag r'] (rng/sample-weighted-bag r candidates (constantly 1) k)]
+            [bag r'] (rng/sample-weighted-bag r candidates weight-fn k)]
         (if (compare-and-set! rng-atom r r') bag (recur))))
     (first (rng/sample-weighted-bag (rng/make (secure-word))
-                                    candidates (constantly 1) k))))
+                                    candidates weight-fn k))))
 
-(defn- do-sample [runtime {:keys [request-id k from]}]
-  (let [validators (vec (sort (:validators runtime)))
+(defn- do-sample [runtime {:keys [request-id k from powers]}]
+  (let [validators (if powers (sort-by str (keys powers)) (vec (sort (:validators runtime))))
         candidates (if (= from :validators)
                      validators
                      (vec (remove #{(:peer-id runtime)} validators)))]
@@ -362,7 +403,7 @@
       ;; receives `sampled` simply stops, and a Snowman that stops looks
       ;; exactly like a Snowman that has not decided yet.
       (warn! runtime "sample requested with no candidates -- is :validators set?")
-      (emit-event! runtime (n/sampled request-id (draw-sample! (:rng runtime) candidates k))))))
+      (emit-event! runtime (n/sampled request-id (draw-sample! (:rng runtime) candidates (or powers (constantly 1)) k))))))
 
 (defn- do-commit
   "Hand the newly committed vertices to the application, IN ORDER.
@@ -391,7 +432,13 @@
                                  (fn [{:keys [tail trimmed]}]
                                    (let [t (into tail vertices)
                                          over (max 0 (- (count t) (:tail-limit runtime)))]
-                                     {:tail (subvec t over) :trimmed (+ trimmed over)})))]
+                                     {:tail (if (or (zero? (:tail-limit runtime))
+                                                    (and (pos? over)
+                                                         (not= (quot trimmed (:tail-limit runtime))
+                                                               (quot (+ trimmed over) (:tail-limit runtime)))))
+                                              (into [] (subvec t over))
+                                              (subvec t over))
+                                      :trimmed (+ trimmed over)})))]
     (when-let [f (:on-finalize runtime)]
       (if (:legacy-finalize? runtime)
         (let [base (+ (:trimmed previous) (count (:tail previous)))]
@@ -430,7 +477,7 @@
       (throw (ex-info "revert :dropped does not match the committed tail"
                       {:peer (:peer-id runtime) :to to-vertex
                        :claimed claimed :actual actual})))
-    (swap! (:committed runtime) assoc :tail (subvec tail 0 keep-n))
+    (swap! (:committed runtime) assoc :tail (into [] (subvec tail 0 keep-n)))
     (if-let [f (:on-revert runtime)]
       (f to-vertex actual)
       (warn! runtime "reverted" (count actual) "vertices with no :on-revert handler"))))
@@ -439,7 +486,7 @@
   (let [v (vec vertices)
         limit (:tail-limit runtime)
         over (max 0 (- (count v) limit))]
-    (reset! (:committed runtime) {:tail (subvec v over) :trimmed over})
+    (reset! (:committed runtime) {:tail (into [] (subvec v over)) :trimmed over})
     (when-let [f (:on-resync runtime)] (f v))))
 
 (defn- do-report-equivocation [runtime {:keys [peer evidence]}]
@@ -479,6 +526,7 @@
       :set-timer (do-set-timer runtime (:timer-id params) (:after-ticks params))
       :cancel-timer (do-cancel-timer runtime (:timer-id params))
       :request-value (do-request-value runtime (:context params))
+      :read-durable (do-read-durable runtime params)
       :commit (do-commit runtime (:vertices params))
       :log (when (#{:info :warn :error} (:level params))
              (println "[" (:peer-id runtime) "]" (name (:level params)) "-" (:message params)))
@@ -491,7 +539,7 @@
       (throw (ex-info "unknown effect" {:peer (:peer-id runtime) :effect kind})))))
 
 (defn interpret-effects [runtime effects]
-  (doseq [e effects] (interpret-effect runtime e)))
+  (doseq [e effects :while @(:running? runtime)] (interpret-effect runtime e)))
 
 ;; ============================================================
 ;; The loop
@@ -570,12 +618,15 @@
   produces a node that is wrong rather than one that is stopped, and fail-stop
   is the only one of those a consensus system can tolerate."
   [runtime e]
-  (reset! (:error runtime) e)
-  (reset! (:running? runtime) false)
-  (if-let [f (:on-error runtime)]
-    (f e)
-    (println "[" (:peer-id runtime) "] FATAL - consensus event loop halted:"
-             (ex-message e) (pr-str (ex-data e)))))
+  (when (and @(:running? runtime) (compare-and-set! (:error runtime) nil e))
+    (stop-runtime! runtime)
+    ;; An error callback may await shutdown. It cannot run on the event loop
+    ;; or network job that shutdown is draining.
+    (go
+      (if-let [f (:on-error runtime)]
+        (f e)
+        (println "[" (:peer-id runtime) "] FATAL - consensus event loop halted:"
+                 (ex-message e) (pr-str (ex-data e)))))))
 
 (defn run-event-loop
   "The event loop.
@@ -603,7 +654,7 @@
        (if @running?
          (alt!
            event-ch ([event]
-                     (when event
+                     (when (and event @running?)
                        (try (process-event runtime event)
                             (catch #?(:clj Throwable :cljs js/Error) e
                               (handle-loop-error! runtime e)))
@@ -614,6 +665,18 @@
 ;; ============================================================
 ;; Network
 ;; ============================================================
+
+(defn- unsubscribe-handlers! [runtime]
+  (go-try-
+   (loop [entries (seq @(:subscriptions runtime)), failure nil]
+     (if-let [[topic handle] (first entries)]
+       (let [error (try
+                     (<?- (net/unsubscribe! (:network runtime) topic handle))
+                     (swap! (:subscriptions runtime) dissoc topic)
+                     nil
+                     (catch #?(:clj Exception :cljs :default) e e))]
+         (recur (next entries) (or failure error)))
+       (when failure (throw failure))))))
 
 (defn setup-network-handlers
   "Subscribe to exactly the topics the node DECLARED, plus `:direct`.
@@ -633,39 +696,29 @@
   [runtime]
   (go-try-
    (doseq [topic (conj (:topics runtime) direct-topic)]
-     (<?- (net/subscribe!
-           (:network runtime) topic
-           (fn [msg]
-             (let [sender (:sender msg)]
-               ;; Our own broadcasts come back to us; a node counts its own vote
-               ;; in state and must not count it twice.
-               (when (not= sender (:peer-id runtime))
-                 ;; `:direct` is unicast emulated over broadcast, so drop what
-                 ;; was not addressed to us.
-                 ;;
-                 ;; `nil?` and not `(not (contains? …))`: every envelope now
-                 ;; carries `:to`, because it is SIGNED, and a broadcast
-                 ;; carries `:to nil`. Testing for the key's presence therefore
-                 ;; made every broadcast look like a directed message addressed
-                 ;; to nobody, and the whole cluster went silent.
-                 (when (or (nil? (:to msg)) (= (:to msg) (:peer-id runtime)))
-                   ;; VERIFY, then deliver. This is the edge the whole
-                   ;; `verified-by` design rests on and it did not exist: the
-                   ;; set used to be `#{(:sender msg)}`, a field the sender
-                   ;; wrote itself. Verification is async on ClojureScript, so
-                   ;; it happens here, in a go block, and never inside `step`.
-                   (go-try-
-                    (when-let [{:keys [from msg verified-by]}
-                               ;; `:sender` only. `:to` is part of the signed
-                               ;; digest now -- that is what stops a captured
-                               ;; message being re-addressed -- so stripping it
-                               ;; here would make the digest we verify differ
-                               ;; from the one that was signed, and every
-                               ;; directed message would fail.
-                               (<?- (auth/unseal (:auth runtime)
-                                                 (dissoc msg :sender)))]
-                      (emit-event! runtime
-                                   (n/message-received from msg verified-by)))))))))))))
+     (let [handler (fn [envelope]
+                     (when (and @(:running? runtime)
+                                (= topic (:topic envelope))
+                                (not= (:sender envelope) (:peer-id runtime))
+                                (if (= direct-topic topic)
+                                  (= (:peer-id runtime) (:to envelope))
+                                  (nil? (:to envelope))))
+                       (network-job!
+                        runtime
+                        (fn []
+                          (go-try-
+                           (when-let [{:keys [from msg verified-by]}
+                                      (try
+                                        (<?- (auth/unseal (:auth runtime) (dissoc envelope :sender)))
+                                        (catch #?(:clj Exception :cljs :default) e
+                                          (if (::auth/store-error (ex-data e))
+                                            (handle-loop-error! runtime e)
+                                            (swap! (:dropped runtime) inc))
+                                          nil))]
+                             (when @(:running? runtime)
+                               (emit-event! runtime (n/message-received from msg verified-by)))))))))
+           handle (<?- (net/subscribe! (:network runtime) topic handler))]
+       (swap! (:subscriptions runtime) assoc topic handle)))))
 
 ;; ============================================================
 ;; Public API
@@ -725,14 +778,14 @@
          ;; attacker's claim about the attacker's identity, and every Byzantine
          ;; property in this library rested on it. A default would let that
          ;; return silently; `:none` is available and has to be typed.
+         store (or store (store/memory-store))
          authenticator (auth/authenticator
                         (or auth (throw (ex-info (str "start-runtime! needs :auth -- a config map, "
                                                       "or :none to run unauthenticated on purpose")
                                                  {:peer-id peer-id})))
-                        peer-id)
+                        peer-id store)
          emits (n/check-capabilities node)
          topics (n/check-topics node)
-         store (or store (store/memory-store))
          ;; What landed before this node died, in the two views `sim/restart`
          ;; supplies. Passed unconditionally: every algorithm reads it through
          ;; a nil-safe path and replaying an empty log is a no-op, so a fresh
@@ -787,24 +840,55 @@
                    :running? (atom true)
                    :event-ch (chan 100)
                    :control-ch (chan)
+                   :startup-done (chan)
+                   :loop-done (chan)
+                   :subscriptions (atom {})
+                   :network-jobs (atom {:active 0 :closed? false})
+                   :network-drained (chan)
+                   :shutdown (atom nil)
                    :durable-queue (chan 64)})]
-     (<?- (setup-network-handlers runtime))
-     (await-durable-writes! runtime)
-     (run-event-loop runtime)
-     ;; `init` may arm a timer or ask for a value, so its effects are
-     ;; interpreted like any others -- and only after the loop is running, so
-     ;; nothing it produces is dropped.
-     (interpret-effects runtime effects)
-     runtime)))
+     ;; All callbacks share these gates, including ones installed before init
+     ;; finishes. No incoming event can overtake the initial effects.
+     (go (<! (:startup-done runtime))
+         (<! (run-event-loop runtime))
+         (close! (:loop-done runtime)))
+     (try
+       (<?- (setup-network-handlers runtime))
+       (await-durable-writes! runtime)
+       (interpret-effects runtime effects)
+       (when-let [e @(:error runtime)] (throw e))
+       (close! (:startup-done runtime))
+       runtime
+       (catch #?(:clj Exception :cljs :default) e
+         (close! (:startup-done runtime))
+         (<?- (stop-runtime! runtime))
+         (throw e))))))
 
 (defn stop-runtime! [runtime]
-  (go-try-
-   (reset! (:running? runtime) false)
-   (doseq [[_ cancel-fn] @(:timers runtime)] (cancel-fn))
-   (close! (:control-ch runtime))
-   (close! (:durable-queue runtime))
-   (close! (:event-ch runtime))
-   nil))
+  ;; Concurrent stop callers share a completion. A failed unsubscribe keeps
+  ;; its handle and clears this completion so the next stop can retry it.
+  (let [done (promise-chan)
+        [existing _] (swap-vals! (:shutdown runtime) #(or % done))]
+    (if existing
+      existing
+      (do
+        (reset! (:running? runtime) false)
+        (update-network-jobs! runtime #(assoc % :closed? true))
+        (close! (:control-ch runtime))
+        (close! (:durable-queue runtime))
+        (close! (:event-ch runtime))
+        (go
+          (try
+            (when-let [loop-done (:loop-done runtime)] (<?- loop-done))
+            ;; Once the event loop has returned it cannot arm another timer.
+            (doseq [[_ cancel-fn] @(:timers runtime)] (cancel-fn))
+            (<! (:network-drained runtime))
+            (<?- (unsubscribe-handlers! runtime))
+            (catch #?(:clj Exception :cljs :default) e
+              (compare-and-set! (:shutdown runtime) done nil)
+              (>! done e))
+            (finally (close! done))))
+        done))))
 
 (defn send-event!
   "Inject an event. `{:type :start-round}` from the legacy API is translated, so

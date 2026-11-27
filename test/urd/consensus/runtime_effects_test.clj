@@ -13,6 +13,8 @@
   seen fail is a guard nobody knows is connected."
   (:require [clojure.test :refer [deftest is testing]]
             [urd.consensus.runtime :as rt]
+            [urd.consensus.auth :as auth]
+            [urd.consensus.network :as net]
             [urd.consensus.node :as n]
             [urd.consensus.rng :as rng]
             [urd.consensus.store :as store]
@@ -68,6 +70,17 @@
                                    opts)))))
 
 (defn- settle! [] (<!! (timeout 120)))
+
+(deftest reading-explicit-durable-keys-returns-only-their-latest-landed-values
+  (let [storage (store/memory-store {:records [{:writes {:wanted 1 :other 2}}
+                                               {:writes {:wanted 3 :nil-value nil}}]})
+        read-fx (n/read-durable :batch [:wanted :missing :nil-value])
+        runtime (start! {:node (echo-node #{:read-durable} [read-fx]) :store storage})]
+    (try
+      (settle!)
+      (is (= [(n/durable-values :batch {:wanted 3 :nil-value nil})]
+             (:inputs (rt/get-state runtime))))
+      (finally (<!! (rt/stop-runtime! runtime))))))
 
 ;; ============================================================
 ;; persist-then -- the barrier
@@ -659,3 +672,90 @@
       (settle!)
       (is (= [0 1] (keep :token (:inputs (rt/get-state runtime)))))
       (finally (<!! (rt/stop-runtime! runtime))))))
+
+(deftest runtime-checks-the-delivery-topic-and-releases-its-handlers
+  (let [router (sim-net/create-router)
+        network (sim-net/create-simulation-network :p1 router)
+        opts {:node (echo-node #{}) :network network}
+        first-runtime (start! opts)
+        deliver #(sim-net/deliver-message! router :p2 rt/direct-topic
+                                           {:msg %1 :from :p2 :topic %2 :to %3})]
+    (deliver :wrong-topic :other :p1)
+    (deliver :wrong-recipient rt/direct-topic :other)
+    (deliver :correct rt/direct-topic :p1)
+    (settle!)
+    (is (= [:correct] (mapv :msg (:inputs (rt/get-state first-runtime)))))
+    (<!! (rt/stop-runtime! first-runtime))
+    (is (empty? (get-in @router [:peers :p1])))
+    (let [restarted (start! opts)]
+      (deliver :after-restart rt/direct-topic :p1)
+      (settle!)
+      (is (= [:after-restart] (mapv :msg (:inputs (rt/get-state restarted)))))
+      (<!! (rt/stop-runtime! restarted)))))
+
+(deftest retained-commit-tail-releases-its-backing-vector
+  (let [limit 64
+        runtime (start! {:node (echo-node #{:commit}) :tail-limit limit})
+        backing-count (fn [tail]
+                        (count (if (instance? clojure.lang.APersistentVector$SubVector tail)
+                                 (.v ^clojure.lang.APersistentVector$SubVector tail)
+                                 tail)))]
+    (try
+      (dotimes [i 1025] (rt/interpret-effects runtime [(n/commit [i])]))
+      (let [tail (rt/committed-tail runtime)]
+        (is (= (range 961 1025) tail))
+        (is (<= (backing-count tail) (* 2 limit))))
+      (finally (<!! (rt/stop-runtime! runtime))))))
+
+(deftest shutdown-waits-for-network-jobs-and-fences-their-results
+  (let [router (sim-net/create-router)
+        network (sim-net/create-simulation-network :p1 router)
+        sealing (promise)
+        checking (promise)
+        seal-gate (chan 1)
+        verify-gate (chan 1)
+        signer (reify auth/MessageAuth
+                 (seal [_ _ _] (deliver sealing true) seal-gate)
+                 (unseal [_ _] (deliver checking true) verify-gate))
+        runtime (with-redefs [auth/authenticator (constantly signer)]
+                  (start! {:node (echo-node #{:send}) :network network}))
+        direct (get-in @router [:peers :p1 rt/direct-topic])]
+    (rt/send-event! runtime {:type :go :fx [(n/send-to :other :out)]})
+    (direct {:sender :other :topic rt/direct-topic :to :p1})
+    (is (= true (deref sealing 3000 false)))
+    (is (= true (deref checking 3000 false)))
+    (let [done (rt/stop-runtime! runtime)]
+      (is (identical? done (rt/stop-runtime! runtime)))
+      (is (not (clojure.core.async.impl.protocols/closed? done)))
+      (clojure.core.async/>!! seal-gate {:msg :out :topic rt/direct-topic :to :other})
+      (clojure.core.async/>!! verify-gate {:from :other :verified-by #{:other} :msg :in})
+      (is (= done (second (clojure.core.async/alts!! [done (timeout 3000)]))))
+      (is (empty? (sim-net/get-message-log router)))
+      (is (= [:go] (input-types runtime)))
+      (is (empty? (get-in @router [:peers :p1]))))))
+
+(deftest shutdown-retries-only-failed-unsubscriptions
+  (let [attempts (atom {})
+        network (reify net/ConsensusNetwork
+                  (subscribe! [_ topic _] (go topic))
+                  (unsubscribe! [_ topic _]
+                    (let [n (get (swap! attempts update topic (fnil inc 0)) topic)]
+                      (go (if (and (= topic :t) (= n 1))
+                            (ex-info "temporary unsubscribe failure" {})
+                            true)))))
+        runtime (start! {:node (->ThrowingNode #{} false) :network network})]
+    (is (instance? Throwable (<!! (rt/stop-runtime! runtime))))
+    (is (= #{:t} (set (keys @(:subscriptions runtime)))))
+    (is (nil? (<!! (rt/stop-runtime! runtime))))
+    (is (= {:t 2 :direct 1} @attempts))
+    (is (empty? @(:subscriptions runtime)))))
+
+(deftest asynchronous-fail-stop-wakes-the-parked-event-loop
+  (let [runtime (start! {:node (echo-node #{}) :on-error (fn [_])})
+        error (ex-info "authentication store unavailable" {})]
+    (#'rt/handle-loop-error! runtime error)
+    (rt/send-event! runtime {:type :after-failure})
+    (let [done (rt/stop-runtime! runtime)]
+      (is (= done (second (clojure.core.async/alts!! [done (timeout 3000)])))))
+    (is (identical? error (rt/last-error runtime)))
+    (is (empty? (input-types runtime)))))

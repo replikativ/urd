@@ -153,8 +153,6 @@ State this plainly to yourself before trusting a green run:
   no scheduler interleaving, no backpressure. The runtime has all three, and
   `urd.consensus.conformance-test` exists because three bugs lived exactly
   there — the simulator structurally could not have found them.
-- **Sampling is uniform, not weighted.** Both interpreters pass `(constantly 1)`,
-  although `node/sampled` documents multiplicity as vote weight.
 - **Storage faults are konserve's job.** `konserve.simulation.crash` models the
   six crash points along a write path; `clj -M:storage-sim` runs urd against it.
 - **Nakamoto's `tick` event is never delivered** by either interpreter.

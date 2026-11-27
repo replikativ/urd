@@ -93,7 +93,7 @@
   A total predicate; the natural first thing to machine-check."
   [{:keys [k alpha-preference alpha-confidence beta] :as params}]
   (boolean
-   (and k alpha-preference alpha-confidence beta
+   (and (every? integer? [k alpha-preference alpha-confidence beta])
         (pos? k)
         (pos? beta)
         (< (/ k 2) alpha-preference)

@@ -59,6 +59,19 @@ Freshness is checked *before* the signature — the cheap end first — but the
 window is only updated *after* verification succeeds, so a forged sequence
 number cannot lock a peer out.
 
+The runtime saves the sender counter before transmission and atomically claims
+each verified sequence in the receiver's store before delivery. A Konserve
+checkpoint preserves these registers. For an application snapshot install,
+retain the recovering peer's own registers and signing key. A separately
+configured `:auth :replay-store` can keep them outside the replaced WAL.
+An in-memory store provides replay protection only for its own lifetime.
+
+When upgrading a cluster whose counters existed only in memory, stop all
+old signers and coordinate a new authenticated chain identifier across the
+cluster before restarting. Reusing the original chain and keys with empty
+registers allows old envelopes to verify again. Use recovery procedures for
+the consensus signing state as well.
+
 ### One idiom worth copying
 
 ```clojure

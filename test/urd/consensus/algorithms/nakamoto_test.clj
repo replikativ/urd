@@ -603,6 +603,15 @@
           (is (= 1 (get-in (:state r) [:rejected :malformed])))
           (is (= [:log] (map n/effect-kind (:effects r)))))))))
 
+(deftest integral-header-fields-have-one-wire-representation
+  (let [st (scratch)
+        solved (nk/mine (nk/template st {:merkle-root (tag-hex "integer-fields")}) 100000)
+        floating (reduce #(update %1 %2 double) solved [:bits :nonce :time :version])
+        accepted (:state (nk/process-header st floating :peer))]
+    (is (= (nk/header-id solved) (:tip accepted)))
+    (is (= solved (:header (nk/blk accepted (:tip accepted)))))
+    (is (= (nk/calc-work (:bits solved)) (nk/calc-work (:bits floating))))))
+
 (deftest a-future-dated-header-is-rejected-through-the-node-not-just-the-predicate
   (testing "`check-header-sanity` was tested directly with a literal `now`, so
             the one thing that could actually be wrong -- that `connect-one`
@@ -1123,3 +1132,57 @@
         repeat-result (nk/process-header parked (assoc child :transport-tag 1) :b)]
     (is (= parked (:state repeat-result)))
     (is (= [:send] (map n/effect-kind (:effects repeat-result))))))
+
+(deftest locators-recover-a-longer-fork-in-forward-pages
+  (let [base (scratch)
+        node (nk/create)
+        [remote hs] (build base (:tip base) 270 "long")
+        [local _] (build base (:tip base) 145 "incumbent")
+        advertised (last hs)
+        deliver (fn [state sender msg]
+                  (n/step node state (n/message-received sender msg #{sender})))
+        sent (fn [result]
+               (some #(when (= :send (n/effect-kind %)) (:msg (n/effect-params %)))
+                     (:effects result)))
+        parked (deliver local :remote {:kind :header :header advertised})
+        first-request (sent parked)
+        first-page (sent (deliver remote :local first-request))
+        after-page (deliver (:state parked) :remote first-page)
+        ;; Lose the continuation. The next announcement must retain progress
+        ;; on the side branch, even though the incumbent still has more work.
+        retry (sent (deliver (:state after-page) :remote {:kind :header :header advertised}))
+        second-page (sent (deliver remote :local retry))
+        after-second (deliver (:state after-page) :remote second-page)
+        third-page (sent (deliver remote :local (sent after-second)))
+        completed (deliver (:state after-second) :remote third-page)]
+    (is (= (:tip local) (first (:locator first-request))))
+    (is (= (:genesis local) (last (:locator first-request))))
+    (is (= [128 128 13] (mapv #(count (:headers %)) [first-page second-page third-page])))
+    (is (= (:tip local) (:tip (:state after-page))))
+    (is (= (nk/header-id (nth hs 127)) (first (:locator retry))))
+    (is (every? #(not= :broadcast (n/effect-kind %)) (:effects after-page)))
+    (is (= (:tip remote) (:tip (:state completed))))
+    (is (= (:best-chain remote) (:best-chain (:state completed))))
+    (is (empty? (:orphan-at (:state completed))))
+    (is (nil? (sent completed)))
+    (testing "legacy requests still get a single header"
+      (let [msg (sent (deliver remote :local (dissoc first-request :locator :for)))]
+        (is (= {:kind :header :header (nth hs 268)} msg))))
+    (testing "unsolicited or oversized pages have no effects"
+      (is (= local (:state (deliver local :remote first-page))))
+      (is (empty? (:effects (deliver (:state parked) :other first-page))))
+      (let [bad (update first-page :headers conj (first hs))
+            result (deliver (:state parked) :remote bad)]
+        (is (= (:state parked) (:state result)))
+        (is (empty? (:effects result)))))
+    (testing "the ordinary time bound applies to a batch"
+      (let [early (assoc (:state parked) :now 0)
+            result (deliver early :remote first-page)]
+        (is (= 1 (get-in result [:state :rejected :time-too-new])))
+        (is (nil? (nk/blk (:state result) (nk/header-id (first hs)))))))
+    (testing "a discontinuity stops processing after the valid prefix"
+      (let [gap (assoc first-page :headers [(first hs) (nth hs 2)])
+            result (deliver (:state parked) :remote gap)]
+        (is (some? (nk/blk (:state result) (nk/header-id (first hs)))))
+        (is (nil? (nk/blk (:state result) (nk/header-id (nth hs 2)))))
+        (is (nil? (sent result)))))))

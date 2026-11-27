@@ -268,3 +268,12 @@
       (is (:finalized? done))
       (is (= 0 (:preference (sf/binary-record-poll done 4 1)))
           "finalized is absorbing here, unlike the unary form"))))
+
+(deftest avalanchego-id-bit-order
+  (let [id (str "81e2" (apply str (repeat 60 "0")))
+        key (t/avalanche-key id)]
+    (is (= 256 (t/num-bits key)))
+    (is (= [1 0 0 0 0 0 0 1 0 1 0 0 0 1 1 1]
+           (mapv #(t/bit-at key %) (range 16))))
+    (is (nil? (t/avalanche-key "01")))
+    (is (nil? (t/avalanche-key :opaque)))))

@@ -14,7 +14,7 @@
     ...
 
   Each height: the proposer broadcasts, validators vote if the proposal is
-  valid, a majority finalizes, and a timeout bumps the round and retries.
+  valid, a majority finalizes, and a timeout retransmits the outstanding request.
 
   ## Ported from the legacy `ConsensusAlgorithm` protocol
 
@@ -105,12 +105,16 @@
      (or (nil? h) (nat? h))
      (or (nil? r) (nat? r))
      (case (:kind msg)
+       :finalized (some? h)
+       :proposal (and (some? h) (some? r))
+       :want-proposal (some? h)
        :vote (some? (:proposal-id msg))
        (:vote-bundle :catchup)
        (let [v (:votes msg)]
          (or (nil? v) (and (coll? v) (<= (count v) max-vote-bundle))))
        :state-sync-response
        (and (or (nil? (:finalized msg)) (map? (:finalized msg)))
+            (or (nil? (:proofs msg)) (map? (:proofs msg)))
             (or (nil? (:oldest msg)) (nat? (:oldest msg)))
             (or (nil? (:current-height msg)) (nat? (:current-height msg))))
        ;; `:from` here is the REQUESTER'S HEIGHT, not a peer id -- the sender
@@ -125,7 +129,7 @@
   Rotates by height, not round. Ids are sorted so every node computes the same
   answer without coordinating."
   [height validator-set]
-  (let [validator-ids (vec (sort (keys validator-set)))]
+  (let [validator-ids (n/ordered-validator-ids (keys validator-set))]
     (nth validator-ids (mod height (count validator-ids)))))
 
 (defn am-proposer? [state]
@@ -263,7 +267,8 @@
   a bound rather than becoming unbounded because the alternative is a map that
   grows for the life of the process.
 
-  The floor is `height - retention` INCLUSIVE, so this keeps N+1 heights. The
+  The floor is `height - retention` inclusive. The upper bound is the last
+  finalized height, `height - 1`, so this keeps N heights. The
   exact number matters because `answer-state-sync` reports the floor as
   `:oldest` and a requester decides whether it is stranded by comparing against
   it.
@@ -278,8 +283,9 @@
   "Bound `:finalized`, which would otherwise grow for the life of the process."
   [state]
   (let [floor (max 0 (- (:height state)
-                        (:finalized-retention state default-finalized-retention)))]
-    (update state :finalized #(into {} (filter (fn [[h _]] (>= h floor))) %))))
+                        (:finalized-retention state default-finalized-retention)))
+        keep-recent #(into {} (filter (fn [[h _]] (>= h floor))) %)]
+    (-> state (update :finalized keep-recent) (update :finalization-proofs keep-recent))))
 
 ;; ============================================================
 ;; Effects
@@ -379,17 +385,21 @@
   that has seen a quorum knows the height is decided, and needing to be told so
   by its own runtime is a design that cannot be reasoned about locally."
   [state proposal-id extra-effects]
-  (if-not (and (some? proposal-id) (:current-proposal state) (has-quorum? state proposal-id))
+  (if-not (and (some? proposal-id) (:current-proposal state)
+               (valid-voter? (:peer-id state) (:validator-set state))
+               (has-quorum? state proposal-id))
     (n/result state extra-effects)
     (let [proposal (:current-proposal state)
           height (:height state)
-          votes (get (:votes state) proposal-id {})]
-      (n/result (advance-height state height proposal)
+          votes (get (:votes state) proposal-id {})
+          advanced (advance-height state height proposal nil)]
+      (n/result advanced
                 (into extra-effects
                       [(n/cancel-timer :quorum-timeout)
                        (n/commit [proposal])
                        (n/broadcast :finalizations {:kind :finalized :proposal proposal
-                                                    :height height :votes votes})
+                                                    :height height :votes votes
+                                                    :proof (get-in advanced [:finalization-proofs height])})
                        (n/set-timer :next-round (:next-round-delay state))])))))
 
 (defn- activate-updates
@@ -421,7 +431,7 @@
     (if-not (seq updates)
       state
       (let [vset (:validator-set state)
-            cfg {:validators (vec (sort (keys vset)))
+            cfg {:validators (n/ordered-validator-ids (keys vset))
                  :powers (zipmap (keys vset) (repeat 1))}
             result (reconfig/apply-updates cfg updates)]
         (if (:error result)
@@ -436,24 +446,38 @@
           (assoc state :validator-set
                  (into {} (map (fn [v] [v (get vset v)])) (:validators result))))))))
 
+(defn- decision-payload [height proposal]
+  ;; A finalizing member attests the complete value, including any handover.
+  ;; This witness can later be relayed by a member of a disjoint roster.
+  [::finalized height proposal])
+
+(defn- valid-decision-proof? [state height proposal {:keys [signer att]}]
+  (and (valid-voter? signer (:validator-set state))
+       ((:verify-vote state) signer (decision-payload height proposal) att)))
+
 (defn- advance-height
   "Record the decision and move to the next height.
 
   The validator set change rides here, activated from the finalized proposal.
   See `activate-updates` for why this algorithm cannot tolerate nodes
   disagreeing about the set even briefly."
-  [state height proposal]
-  (-> state
-      (activate-updates height proposal)
-      (assoc :height (inc height)
-             :sync-requested-at nil
-             :round 0
-             :phase :proposing
-             :current-proposal nil
-             :current-proposal-id nil
-             :votes {})
-      (assoc-in [:finalized height] proposal)
-      cleanup-old-data))
+  [state height proposal proof]
+  (let [peer (:peer-id state)
+        proof (or proof (when (valid-voter? peer (:validator-set state))
+                          {:signer peer
+                           :att ((:sign-vote state) peer (decision-payload height proposal))}))]
+    (-> state
+        (cond-> proof (assoc-in [:finalization-proofs height] proof))
+        (activate-updates height proposal)
+        (assoc :height (inc height)
+               :sync-requested-at nil
+               :round 0
+               :phase :proposing
+               :current-proposal nil
+               :current-proposal-id nil
+               :votes {})
+        (assoc-in [:finalized height] proposal)
+        cleanup-old-data)))
 
 (defn handle-start-round [state]
   (if (am-proposer? state)
@@ -556,14 +580,6 @@
     (not (valid-voter? voter (:validator-set state)))
     (n/result state [(log state :warn (str "rejecting vote from unknown validator " voter))])
 
-    (not ((:verify-vote state) voter (vote-payload state proposal-id) att))
-    ;; Rejected here as well as in `record-vote`, so the reason is LOGGED. A
-    ;; forged vote that is merely not counted looks identical to a vote that
-    ;; never arrived, and an operator has no way to tell a broken link from a
-    ;; peer minting votes for its neighbours.
-    (n/result state [(log state :warn (str "rejecting unattested vote claiming to be from "
-                                           voter))])
-
     (or (nil? proposal-id) (not= proposal-id (:current-proposal-id state)))
     (n/result state [(log state :debug "ignoring vote for a non-current proposal")])
 
@@ -574,12 +590,16 @@
     (n/result state [(log state :debug (str "ignoring duplicate vote from " voter))])
 
     :else
-    (maybe-finalize (record-vote state proposal-id voter att) proposal-id [])))
+    (let [recorded (record-vote state proposal-id voter att)]
+      (if (identical? state recorded)
+        (n/result state [(log state :warn (str "rejecting unattested vote claiming to be from " voter))])
+        (maybe-finalize recorded proposal-id [])))))
 
 (defn handle-finalization
   "A peer told us a height finalized, or our own commit did."
-  [state proposal height]
-  (cond
+  ([state proposal height] (handle-finalization state proposal height nil))
+  ([state proposal height proof]
+   (cond
     ;; ANY height above ours means we are behind. This was
     ;; `(> height (inc (:height state)))` -- two or more ahead -- so a node
     ;; exactly ONE height behind fell through to the `:else` branch, logged
@@ -592,7 +612,7 @@
     ;; and its `:want-proposal` requests are only answered by peers still at h,
     ;; of which there are none. The trace shows it plainly -- a stranded node
     ;; receives 41 proposals and 143 finalizations and commits nothing.
-    (> height (:height state))
+     (> height (:height state))
     ;; ONCE per height, not once per finalization seen.
     ;;
     ;; Correct and unthrottled is a message storm. Every peer's finalization
@@ -605,12 +625,13 @@
     ;;
     ;; This is the shape to watch for generally: a fix that is correct per
     ;; message and wrong per second.
-    (if (= (:sync-requested-at state) (:height state))
-      (n/result state)
-      (n/result (assoc state :sync-requested-at (:height state))
-                [(log state :info (str "behind: at " (:height state)
-                                       ", saw finalization for " height))
-                 (recovery :state-sync {:from (:height state) :to height})]))
+     (if (= (:sync-requested-at state) (:height state))
+       (n/result state)
+       (n/result (assoc state :sync-requested-at (:height state))
+                 [(log state :info (str "behind: at " (:height state)
+                                        ", saw finalization for " height))
+                  (recovery :state-sync {:from (:height state) :to height})
+                  (n/set-timer :sync-retry (:sync-retry-delay state))]))
 
     ;; A peer announcing a DIFFERENT proposal for the height we are working on
     ;; is not a decision we can adopt: we hold one proposal for this height and
@@ -625,27 +646,27 @@
     ;; Derived from `:current-proposal` rather than read from
     ;; `:current-proposal-id`. The id is a cache of the proposal, and a safety
     ;; guard should not be able to fail open because a cache was not filled in.
-    (and (= height (:height state))
-         (:current-proposal state)
-         (not= proposal (:current-proposal state)))
-    (n/result state
-              [(log state :warn
-                    (str "REFUSING a finalization for height " height
-                         " naming " (proposal-id proposal)
-                         " -- we hold " (proposal-id (:current-proposal state))))])
+     (and (= height (:height state))
+          (:current-proposal state)
+          (not= proposal (:current-proposal state)))
+     (n/result state
+               [(log state :warn
+                     (str "REFUSING a finalization for height " height
+                          " naming " (proposal-id proposal)
+                          " -- we hold " (proposal-id (:current-proposal state))))])
 
-    (valid-proposal? state proposal height (:round state))
+     (valid-proposal? state proposal height (:round state))
     ;; A peer reached quorum before we did, so we learn the decision from its
     ;; announcement and commit it ourselves. A node that already finalized this
     ;; height locally has moved on and takes the `:else` branch below, so no
     ;; height is ever committed twice.
-    (n/result (advance-height state height proposal)
-              [(log state :info (str "finalized height " height " from a peer"))
-               (n/commit [proposal])
-               (n/set-timer :next-round (:next-round-delay state))])
+     (n/result (advance-height state height proposal proof)
+               [(log state :info (str "finalized height " height " from a peer"))
+                (n/commit [proposal])
+                (n/set-timer :next-round (:next-round-delay state))])
 
-    :else
-    (n/result state [(log state :debug (str "already finalized height " height))])))
+     :else
+     (n/result state [(log state :debug (str "already finalized height " height))]))))
 
 (defn handle-timeout [state timer-id]
   (case timer-id
@@ -822,36 +843,43 @@
   compaction finding), not something to paper over. It is reported at `:warn`,
   because the alternative is what this function used to do: jump, and look
   caught up."
-  [state finalized-heights current-height oldest]
-  (let [h0 (:height state)
-        advanced (loop [st state]
-                   (let [h (:height st)
-                         proposal (get finalized-heights h)]
-                     (if (and (some? proposal)
-                              (valid-proposal? st proposal h (:round st))
-                              (or (nil? (:current-proposal st))
-                                  (= (:current-proposal st) proposal)))
-                       (recur (advance-height st h proposal))
-                       st)))
-        new-height (:height advanced)
-        learned (range h0 new-height)
-        advanced? (> new-height h0)
-        stranded? (and (not advanced?)
-                       (some? oldest)
-                       (> oldest h0)
-                       (> current-height h0))]
-    (n/result advanced
-              (into [(if stranded?
-                       (log state :warn
-                            (str "state sync: cannot catch up from this peer -- we are at "
-                                 h0 " and its history starts at " oldest
-                                 ". Retrying; a peer with deeper history may appear."))
-                       (log state :info (str "state sync: now at height " new-height
-                                             ", learned " (count learned))))]
-                    (concat
-                     (map (fn [h] (n/commit [(get finalized-heights h)])) learned)
-                     (when advanced?
-                       [(n/set-timer :next-round (:next-round-delay state))])
+  ([state finalized-heights current-height oldest]
+   (handle-state-sync-response state finalized-heights current-height oldest (:peer-id state) {}))
+  ([state finalized-heights current-height oldest sender proofs]
+   (let [h0 (:height state)
+         advanced (loop [st state]
+                    (let [h (:height st)
+                          proposal (get finalized-heights h)
+                          proof (get proofs h)
+                          verified (when (and proposal proof (valid-decision-proof? st h proposal proof))
+                                     proof)]
+                      (if (and (or verified (valid-voter? sender (:validator-set st)))
+                               (some? proposal)
+                               (valid-proposal? st proposal h (:round st))
+                               (or (nil? (:current-proposal st))
+                                   (= (:current-proposal st) proposal)))
+                        (recur (advance-height st h proposal verified))
+                        st)))
+         new-height (:height advanced)
+         learned (range h0 new-height)
+         advanced? (> new-height h0)
+         stranded? (and (not advanced?)
+                        (valid-voter? sender (:validator-set state))
+                        (some? oldest)
+                        (> oldest h0)
+                        (some? current-height) (> current-height h0))]
+     (n/result advanced
+               (into [(if stranded?
+                        (log state :warn
+                             (str "state sync: cannot catch up from this peer -- we are at "
+                                  h0 " and its history starts at " oldest
+                                  ". Retrying; a peer with deeper history may appear."))
+                        (log state :info (str "state sync: now at height " new-height
+                                              ", learned " (count learned))))]
+                     (concat
+                      (map (fn [h] (n/commit [(get finalized-heights h)])) learned)
+                      (when advanced?
+                        [(n/set-timer :next-round (:next-round-delay state))])
                      ;; Arm a retry. `:sync-requested-at` is set to the current
                      ;; height to throttle the request storm, and a stranded
                      ;; node never leaves that height -- so it asked once, was
@@ -867,8 +895,8 @@
                      ;; which is exactly the storm the flag exists to prevent.
                      ;; The throttle and the retry are both necessary and they
                      ;; are in tension; the timer is what resolves it.
-                     (when stranded?
-                       [(n/set-timer :sync-retry (:sync-retry-delay state))]))))))
+                      (when stranded?
+                        [(n/set-timer :sync-retry (:sync-retry-delay state))])))))))
 
 (defn answer-state-sync
   "A peer is behind. Send the history it asked for, and say what we still hold.
@@ -888,6 +916,7 @@
     (n/result state
               [(n/send-to to {:kind :state-sync-response
                               :finalized wanted
+                              :proofs (select-keys (:finalization-proofs state) (keys wanted))
                               :oldest (if (seq fin) (apply min (keys fin)) 0)
                               :current-height (:height state)})])))
 
@@ -991,15 +1020,165 @@
 ;; The node
 ;; ============================================================
 
+(defn- dispatch [state input]
+  (case (:type input)
+    :timer-fired (handle-timeout state (:timer-id input))
+
+    :value-ready (if (= (:height state) (get (:context input) :height (:height state)))
+                   (handle-value-ready state (:value input))
+                   (n/result state))
+
+    :message-received
+    (let [msg (:msg input)
+          from (:from input)]
+      (if-not (well-formed? msg)
+        (n/result state)
+        (case (:kind msg)
+          :proposal (handle-proposal-received state (:proposal msg) (:height msg)
+                                              (:round msg) from)
+          :vote (handle-vote-received state (:proposal-id msg) (:voter msg) (:att msg))
+          :finalized
+          (let [{:keys [height proposal proof]} msg
+                verified (when (and (= height (:height state)) proof
+                                    (valid-decision-proof? state height proposal proof))
+                           proof)]
+            (if (or (valid-voter? from (:validator-set state))
+                    verified
+                    (and height (> height (:height state))))
+              (handle-finalization state proposal height verified)
+              (n/result state)))
+          :catchup (handle-proposal-catchup state (:proposal msg) (:height msg)
+                                            (:round msg) (:votes msg))
+          :state-sync-response (handle-state-sync-response state (:finalized msg)
+                                                           (:current-height msg)
+                                                           (:oldest msg) from (:proofs msg))
+          :vote-bundle (handle-vote-bundle state (:proposal-id msg) (:votes msg))
+            ;; A recovery REQUEST is answered HERE. The legacy runtime answered
+            ;; these itself, outside the state machine -- which is why it needed to
+            ;; know five algorithm-specific effects by name, and why porting the
+            ;; algorithm without them stalled completely under message loss: the
+            ;; requests still went out and nobody replied. A node answering a
+            ;; question about its own state is the state machine's job.
+          :want-proposal (answer-want-proposal state (:height msg) (:round msg) from)
+          :want-votes (answer-want-votes state (:proposal-id msg) from)
+          :state-sync (answer-state-sync state from (:from msg))
+          (n/result state [(log state :debug (str "unhandled message kind " (:kind msg)))]))))
+
+      ;; An unrecognised input is LOGGED, never silently dropped -- the same
+      ;; rule `schedule` applies to an unknown step and `signing` to an unknown
+      ;; signing step. A machine that quietly ignores what it does not
+      ;; understand cannot be distinguished from one that is working.
+    (n/result state [(log state :warn (str "unknown input type " (:type input)))])))
+
+(defn- durable-record [before after effects token]
+  {:version 1 :peer-id (:peer-id after) :token token
+   :from-height (:height before) :height (:height after)
+   :validators (n/ordered-validator-ids (keys (:validator-set after)))
+   :proposal (:current-proposal after)
+   :own-vote (get-in after [:votes (:current-proposal-id after) (:peer-id after)])
+   :decisions (into [] (comp (filter #(= :commit (first %)))
+                             (mapcat #(get-in % [1 :vertices]))) effects)
+   :proofs (select-keys (:finalization-proofs after)
+                        (range (:height before) (:height after)))})
+
+(defn- fenced-step [state input]
+  (let [{after :state effects :effects} (dispatch state input)
+        changed? (or (not= (:height state) (:height after))
+                     (not= (:current-proposal state) (:current-proposal after)))
+        token (::write-token state 0)]
+    (cond
+      changed?
+      (let [token (inc token)
+            record (durable-record state after effects token)]
+        (n/result (-> after
+                      (assoc ::write-token token)
+                      (assoc-in [::waiting token] effects))
+                  [(n/persist-then {:writes {::wal record} :durable? true
+                                    :epoch 0 :token token :then []})]))
+
+      ;; A recovery request or timeout can reveal a proposal selected by an
+      ;; earlier event. Keep those replies behind its barrier as well.
+      (seq (::waiting state))
+      (n/result (update-in after [::waiting token] into effects))
+
+      :else (n/result after effects))))
+
+(defn- release-persisted [state {:keys [token epoch]}]
+  (if (and (= 0 epoch) (contains? (::waiting state) token))
+    (loop [s (update state ::landed (fnil conj #{}) token) effects []]
+      (let [next-token (inc (::released s 0))]
+        (if (contains? (::landed s) next-token)
+          (recur (-> s (assoc ::released next-token)
+                     (update ::landed disj next-token)
+                     (update ::waiting dissoc next-token))
+                 (into effects (get-in s [::waiting next-token])))
+          (n/result s effects))))
+    (n/result state)))
+
+(defn- restore-node [base config]
+  (let [restored (:restored config)
+        records (mapv #(get-in % [:writes ::wal]) (:writes restored))
+        cursor (:delivered-through config)
+        ;; Each record repeats the resulting height. A partial or foreign WAL
+        ;; must never reopen a height at which this identity already voted.
+        history (reduce (fn [prefix [index record]]
+                          (let [{:keys [version peer-id token from-height height decisions validators]} record]
+                            (when-not (and (= version 1) (= peer-id (:peer-id base))
+                                           (= token (inc index)) (= from-height (count prefix))
+                                           (vector? decisions) (every? (comp some? proposal-id) decisions)
+                                           (= height (+ from-height (count decisions)))
+                                           (contains? record :proposal)
+                                           (or (nil? (:proposal record)) (some? (proposal-id (:proposal record))))
+                                           (vector? validators) (seq validators)
+                                           (= (count validators) (count (set validators))))
+                              (throw (ex-info "invalid round-robin history"
+                                              {:record index :peer-id (:peer-id base)})))
+                            (into prefix decisions)))
+                        [] (map-indexed vector records))
+        last-record (peek records)
+        height (count history)]
+    (when-not (and (or (nil? cursor) (and (integer? cursor) (<= 0 cursor height)))
+                   (or last-record
+                       (and (empty? (:durable restored))
+                            (not (:require-round-robin-history? config))))
+                   (= (select-keys last-record [:version :token :height :peer-id])
+                      (select-keys (get-in restored [:durable ::wal]) [:version :token :height :peer-id])))
+      (throw (ex-info "round-robin requires complete durable history for this identity and application cursor"
+                      {:peer-id (:peer-id base) :height height :delivered-through cursor})))
+    (let [{:keys [validators proposal own-vote token]} last-record
+          pid (when proposal (proposal-id proposal))
+          ;; Apply retention only to network recovery. Application replay needs
+          ;; the entire durable prefix when its cursor is unavailable.
+          state (if last-record
+                  (-> base
+                      (assoc :height height
+                             :validator-set (zipmap validators (map (:validator-set base) validators))
+                             :phase (if proposal :voting :proposing)
+                             :current-proposal proposal :current-proposal-id pid
+                             :finalized (into {} (map-indexed vector history))
+                             :finalization-proofs (reduce #(merge %1 (:proofs %2)) {} records)
+                             ::write-token token ::released token)
+                      (cond-> own-vote (assoc-in [:votes pid (:peer-id base)] own-vote))
+                      cleanup-old-data)
+                  base)
+          replay (cond
+                   (and cursor (< cursor height)) [(n/commit (subvec history cursor))]
+                   (and (nil? cursor) (pos? height)) [(n/resync history)]
+                   :else [])
+          resume (if proposal
+                   (cond-> [(n/set-timer :quorum-timeout (:quorum-timeout state))]
+                     (am-proposer? state)
+                     (conj (n/broadcast :proposals {:kind :proposal :height height
+                                                    :round (:round state) :proposal proposal})))
+                   [(n/set-timer :next-round (:next-round-delay state))])]
+      (n/result state (into replay resume)))))
+
 (defrecord RoundRobin [validator-set]
   n/Node
 
   (capabilities [_]
-    ;; Crash-fault tolerant and absolutely final: a majority-voted proposal is
-    ;; never taken back. No `:sample`, no `:persist-then` -- this algorithm keeps
-    ;; no durable state, which is a real limitation rather than an omission and
-    ;; is why it is a reference rather than a deployment candidate.
-    {:emits #{:broadcast :send :set-timer :cancel-timer :request-value :commit :log}
+    {:emits #{:broadcast :send :set-timer :cancel-timer :request-value :commit :resync
+              :persist-then :log}
      :topics #{:proposals :votes :finalizations :recovery}})
 
   (init [_ config]
@@ -1011,6 +1190,9 @@
           ;; operator can read it.
           vset (or validator-set
                    (zipmap (n/validator-set config) (repeat nil)))
+          _ (when-not (and (map? vset) (seq vset))
+              (throw (ex-info "round-robin needs a non-empty validator map"
+                              {:peer-id (:peer-id config)})))
           ;; REQUIRED, not defaulted, following Bullshark. A vote here is
           ;; relayed -- `:vote-bundle` and `:catchup` exist to carry other
           ;; nodes' votes -- so the peer handing us one is usually not its
@@ -1025,62 +1207,25 @@
           verify-vote (or (:verify-vote config)
                           (throw (ex-info "round-robin requires :verify-vote -- (fn [voter vote-payload att]) -> boolean"
                                           {:peer-id (:peer-id config)})))]
-      (n/result (merge cfg
-                       {:peer-id (:peer-id config)
-                        :sign-vote sign-vote
-                        :verify-vote verify-vote
-                        :validator-set vset
-                        :height 0
-                        :round 0
-                        :phase :proposing
-                        :current-proposal nil
-                        :current-proposal-id nil
-                        :votes {}
-                        :finalized {}})
-                [(n/set-timer :next-round (:next-round-delay cfg))])))
+      (restore-node (merge (dissoc cfg :restored)
+                           {:peer-id (:peer-id config)
+                            :sign-vote sign-vote
+                            :verify-vote verify-vote
+                            :validator-set vset
+                            :height 0
+                            :round 0
+                            :phase :proposing
+                            :current-proposal nil
+                            :current-proposal-id nil
+                            :votes {}
+                            :finalized {}
+                            :finalization-proofs {}})
+                    config)))
 
   (step [_ state input]
-    (case (:type input)
-      :timer-fired (handle-timeout state (:timer-id input))
-
-      :value-ready (if (= (:height state) (get (:context input) :height (:height state)))
-                     (handle-value-ready state (:value input))
-                     (n/result state))
-
-      :message-received
-      (let [msg (:msg input)
-            from (:from input)]
-        (if-not (and (well-formed? msg)
-                     (or (not (#{:finalized :state-sync-response} (:kind msg)))
-                         (valid-voter? from (:validator-set state))))
-          (n/result state)
-          (case (:kind msg)
-            :proposal (handle-proposal-received state (:proposal msg) (:height msg)
-                                                (:round msg) from)
-            :vote (handle-vote-received state (:proposal-id msg) (:voter msg) (:att msg))
-            :finalized (handle-finalization state (:proposal msg) (:height msg))
-            :catchup (handle-proposal-catchup state (:proposal msg) (:height msg)
-                                              (:round msg) (:votes msg))
-            :state-sync-response (handle-state-sync-response state (:finalized msg)
-                                                             (:current-height msg)
-                                                             (:oldest msg))
-            :vote-bundle (handle-vote-bundle state (:proposal-id msg) (:votes msg))
-            ;; A recovery REQUEST is answered HERE. The legacy runtime answered
-            ;; these itself, outside the state machine -- which is why it needed to
-            ;; know five algorithm-specific effects by name, and why porting the
-            ;; algorithm without them stalled completely under message loss: the
-            ;; requests still went out and nobody replied. A node answering a
-            ;; question about its own state is the state machine's job.
-            :want-proposal (answer-want-proposal state (:height msg) (:round msg) from)
-            :want-votes (answer-want-votes state (:proposal-id msg) from)
-            :state-sync (answer-state-sync state from (:from msg))
-            (n/result state [(log state :debug (str "unhandled message kind " (:kind msg)))]))))
-
-      ;; An unrecognised input is LOGGED, never silently dropped -- the same
-      ;; rule `schedule` applies to an unknown step and `signing` to an unknown
-      ;; signing step. A machine that quietly ignores what it does not
-      ;; understand cannot be distinguished from one that is working.
-      (n/result state [(log state :warn (str "unknown input type " (:type input)))]))))
+    (if (= :persisted (:type input))
+      (release-persisted state input)
+      (fenced-step state input))))
 
 (defn create
   "A round-robin node.

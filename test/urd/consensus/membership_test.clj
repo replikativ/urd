@@ -126,10 +126,13 @@
             set are separate things in the simulator."
     (let [s0 (sim/run (tm-cluster {}) 200)
           h (:height (sim/node-state s0 :a))
-          ;; :e arrives, reachable but not yet a validator.
+          ;; Transfer the actual committed boundary from the donor. The
+          ;; joiner keeps its own voting identity and signing registers.
+          boundary (select-keys (get-in s0 [:storage :a :durable])
+                                [:decided-through :validators :powers :priorities])
           s1 (sim/add-peer s0 :e (tm/make)
                            {:validators peers
-                            :restored {:durable {:decided-through (dec h)} :writes []}})
+                            :restored {:durable boundary :writes []}})
           _ (is (= peers (:validators (sim/node-state s1 :a)))
                 ":e is reachable and NOT yet counted")
           ;; Now the cluster votes it in.

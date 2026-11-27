@@ -1164,104 +1164,26 @@
 ;; Joining by state sync
 ;; ============================================================
 
-(deftest a-node-joins-at-a-height-without-replaying-any-history
-  (testing "the path a NEW VALIDATOR takes, and the reason it is not blocked on
-            a consensus-level history transfer.
-
-           There is no archival tier anywhere in this library. Every algorithm
-           bounds catch-up with an in-memory window, and compaction truncates
-           the DURABLE log to match -- so a peer far enough behind cannot be
-           caught up from anyone's consensus state, however many peers are
-           healthy. Widening retention only moves the number.
-
-           The way out is the one CometBFT takes and the one kabel and
-           konserve-sync already implement: transfer the APPLICATION state, not
-           the block history, and start consensus above it. urd's side of that
-           is already here -- `:decided-through` is a trusted register, and a
-           node handed nothing but that register starts above it holding no
-           history at all.
-
-           Modelled by wiping the consensus log down to the register while
-           KEEPING what the node had committed, because that is what a state
-           sync leaves behind: konserve-sync moved the database, the consensus
-           log did not come with it."
-    (let [s (sim/run (fresh) 400)
-          h (:height (sim/node-state s :b))
-          decided (dec h)
-          committed-before (count (sim/committed s :b))
-          joined (-> s
-                     (sim/crash :b)
-                     ;; No history. One trusted number, which is all a state
-                     ;; sync can hand over.
-                     (assoc-in [:storage :b :landed] [])
-                     (assoc-in [:storage :b :durable] {:decided-through decided})
-                     (sim/restart :b)
-                     (sim/run 400))
-          st (sim/node-state joined :b)]
-      (is (> h 3) "the cluster must have real history for the join to skip any")
-      (is (>= (:height st) h)
-          "the joiner resumes ABOVE the height it was handed, not at 0")
-      (is (empty? (:decisions (sim/node-state (-> s (sim/crash :b)
-                                                  (assoc-in [:storage :b :landed] [])
-                                                  (assoc-in [:storage :b :durable]
-                                                            {:decided-through decided})
-                                                  (sim/restart :b))
-                                              :b)))
-          "holding no decisions -- it replayed nothing, which is the point")
-      (is (= committed-before
-             (count (take committed-before (sim/committed joined :b))))
-          "and it did NOT re-deliver the heights it already had: a joiner that
-           re-commits its transferred prefix hands the ledger every transaction
-           a second time")
-      (is (sim/agreement? joined)
-          "it agrees with the peers it joined")
-      (is (> (count (sim/committed joined :b)) committed-before)
-          "and goes on committing, so it really did rejoin consensus rather
-           than sitting silent above its checkpoint"))))
-
-(deftest the-transferred-ledger-is-itself-the-join-checkpoint
-  (testing "closing the loop, and removing a trusted input rather than adding one.
-
-           A state-synced joiner needs to know which height its transferred
-           database corresponds to. The obvious design hands it a number
-           alongside the data -- one more thing to trust, and one more thing to
-           get wrong or forge.
-
-           It is unnecessary. The database knows how many values it applied,
-           and for this algorithm that count IS the height: one height decides
-           one value, heights start at 0, so a consumer holding N values has
-           seen 0..N-1 and starts at N. `:delivered-through` -- built so a
-           RESTARTING node would stop re-delivering -- answers a joiner's
-           question too, because they are the same question.
-
-           So konserve-sync moves the database and nothing else has to travel
-           with it."
-    (testing "a joiner with no consensus state at all starts from its ledger"
-      (let [{st :state fx :effects}
-            (node/init (tm/make) {:peer-id :new :validators [:a :b :c :new]
-                                  :delivered-through 500
-                                  :restored {:durable {} :writes []}})]
-        (is (= 500 (:height st)))
-        (is (empty? (:decisions st)) "having replayed nothing")
-        (is (empty? (filter #(= :commit (node/effect-kind %)) fx))
-            "and it must NOT re-deliver: the ledger already holds those values,
-             and handing them over again writes every transaction twice")))
-
-    (testing "and whichever source is further along wins"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"application replay is unavailable"
-                            (node/init (tm/make)
-                                       {:peer-id :n :validators [:a :b :c]
-                                        :delivered-through 10
-                                        :restored {:durable {:decided-through 90}
-                                                   :writes []}}))
-          "a consumer behind the available decisions needs state transfer")
-      (is (= 300 (:height (:state (node/init (tm/make)
-                                             {:peer-id :n :validators [:a :b :c]
-                                              :delivered-through 300
-                                              :restored {:durable {:decided-through 90}
-                                                         :writes []}}))))
-          "the consumer, when it is ahead -- a node whose log was wiped but
-           whose ledger survived"))))
+(deftest state-transfer-needs-a-height-matched-validator-checkpoint
+  (let [impl (tm/make)
+        cfg {:peer-id :a :validators peers :delivered-through 500}
+        validators [:a :new]
+        powers {:a 1 :new 4}
+        priorities {:a -2 :new 2}
+        checkpoint {:decided-through 499 :validators validators :powers powers
+                    :priorities priorities :post-activation? true}
+        boot (fn [boundary]
+               (:state (node/init impl (assoc cfg :restored {:durable boundary :writes []}))))
+        st (boot checkpoint)]
+    (is (= 500 (:height st)))
+    (is (= validators (:validators st)))
+    (is (= (proposer/advance priorities powers) (:priorities st)))
+    (is (empty? (:decisions st)))
+    (doseq [wrong [{} (assoc checkpoint :decided-through 490)
+                   (dissoc checkpoint :powers) (dissoc checkpoint :priorities)
+                   (assoc checkpoint :priorities {:a 0})]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"height-matched validator checkpoint"
+                            (boot wrong))))))
 
 ;; ============================================================
 ;; Transferable commit certificates
@@ -1434,7 +1356,7 @@
       ;; stored value takes one.
       (let [powers (zipmap peers (repeat 1))
             stored {:a 7 :b -3 :c -2 :d -2}
-            durable {:decided-through 999999 :priorities stored}
+            durable {:decided-through 999999 :priorities stored :validators peers :powers powers}
             _ (assert (= 1000000 (inc 999999)))
             {st :state} (node/init (tm/make)
                                    {:peer-id :b :validators peers
@@ -1778,7 +1700,9 @@
 
 (deftest checkpoint-replay-restores-the-next-heights-lock
   (let [impl (tm/make)
-        checkpoint {:decided-through 8 :decisions {8 :finished}}
+        checkpoint {:decided-through 8 :decisions {8 :finished}
+                    :validators peers :powers (zipmap peers (repeat 1))
+                    :priorities (proposer/initial-priorities peers)}
         vote {:type :precommit :height 9 :round 2 :from :b :value-id :locked}
         suffix {:wal vote :last-signed {:height 9 :round 2 :step :precommit}}
         writes (mapv (fn [w] {:writes w :durable? true}) [checkpoint suffix])
@@ -1854,3 +1778,43 @@
     (is (seq history))
     (is (every? tm/valid-content-id? history))
     (is (sim/agreement? s))))
+
+(deftest legacy-signer-without-its-wal-waits-for-a-decision
+  (let [impl (tm/make)
+        witness {:height 0 :round 1 :step :precommit}
+        boot (fn [d] (:state (node/init impl {:peer-id :b :validators peers
+                                              :restored {:durable (assoc d :last-signed witness)
+                                                         :writes []}})))
+        legacy (boot {})
+        lock {:witness witness :round 1 :value-id :v}
+        restored (boot {:signing-lock lock})
+        try-vote (fn [st] (#'tm/broadcast-prevote (assoc (#'tm/fresh-fx st) :round 2) :v))]
+    (is (= 0 (:voting-blocked-through legacy)))
+    (is (empty? (get-in (try-vote legacy) [:fx :signed])))
+    (is (= [:v 1] (tm/locked restored)))
+    (is (= (assoc lock :witness {:height 0 :round 2 :step :prevote})
+           (get-in (try-vote restored) [:fx :signed 0 :signing-lock])))))
+
+(deftest a-certificate-survives-normal-and-checkpoint-restart-and-can-be-relayed
+  (let [impl (tm/make)
+        cfg (merge {:peer-id :a :validators peers :wal-retention 0} (tm/test-attestations))
+        initial (:state (node/init impl cfg))
+        cert {:height 0 :round 3 :value-id :decision
+              :votes (into {} (for [p peers]
+                                [p ((:sign-vote cfg) p (tm/vote-payload 0 3 :decision))]))}
+        send-msg (fn [s from m] (node/step impl s (node/message-received from (assoc m :from from) #{from})))
+        catchup {:type :catchup :height 0 :decision :decision}
+        uncertified (:state (send-msg initial :relay catchup))
+        result (send-msg initial :relay (assoc catchup :cert cert))
+        persisted (->> (:effects result) (filter #(= :persist-then (node/effect-kind %))) first node/effect-params)
+        normal (:writes persisted)
+        checkpoint (:writes (first (:checkpoint persisted)))]
+    (is (empty? (:catchup-claims uncertified)))
+    (is (= :decision (get-in result [:state :decisions 0])))
+    (is (= cert (get-in normal [:wal :certificate])))
+    (is (= cert (get-in checkpoint [:certificates 0])))
+    (doseq [record [normal checkpoint]]
+      (let [st (:state (node/init impl (assoc cfg :restored {:durable record :writes [{:writes record}]})))
+            reply (->> (:effects (send-msg st :new-peer {:type :status :height 0}))
+                       (filter #(= :send (node/effect-kind %))) first node/effect-params)]
+        (is (= cert (get-in reply [:msg :cert])))))))

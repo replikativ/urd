@@ -173,8 +173,8 @@
         (is (not (contains? (emits impl) :revert))
             (str nm " must not declare :revert -- it never revokes")))
       (is (contains? (emits (sm/create)) :sample) "only Snowman samples")
-      (is (not (contains? (emits (sm/create)) :persist-then))
-          "and Snowman has no durable state at all"))))
+      (is (contains? (emits (sm/create)) :persist-then)
+          "Snowman persists its accepted frontier"))))
 
 ;; ============================================================
 ;; Tracing

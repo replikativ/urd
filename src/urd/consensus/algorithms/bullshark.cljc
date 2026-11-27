@@ -145,6 +145,10 @@
   (str (hasch/uuid {:author author :round round :payload payload
                     :parents (set parents)})))
 
+(defn- canonical-parents? [header]
+  (let [parents (:parents header)]
+    (and (set? parents) (every? string? parents))))
+
 (defn certificate-id
   "The digest of a certificate: (header-id, round, author).
 
@@ -245,7 +249,14 @@
   found the same way -- the lesson was recorded there and never applied here."
   [round validators stake]
   (let [total (reduce + 0 (map #(get stake % 1) validators))
-        [x _] (rng/next-int (rng/from-key round) (max 1 total))]
+        seed (rng/from-key round)
+        ;; xorshift draws 1..2^32-1. At large totals a single word spans
+        ;; less than two buckets; translate to a zero-based draw explicitly.
+        x (if (<= total 2147483647)
+            (first (rng/next-int seed total))
+            (loop [r seed]
+              (let [[w next-r] (rng/next-word r)]
+                (if (<= w total) (dec w) (recur next-r)))))]
     (loop [[v & more] validators, acc 0]
       (let [acc' (+ acc (get stake v 1))]
         (if (or (nil? more) (< x acc'))
@@ -522,12 +533,60 @@
 ;;
 ;; Narwhal keeps the two apart for this reason: `ConsensusState.dag` is the
 ;; lossy working set and `CertificateStore` is the durable archive, and the
-;; Synchronizer answers from the store. `:certificates` here is that store; it
+;; Synchronizer answers from the store. `:certificates` is its recent window; it
 ;; also holds the genesis certificates, which the consensus GC removes as soon
 ;; as anything commits and which round-1 parent resolution still needs.
 ;; ============================================================
 
 (defn- stored [state d] (get (:certificates state) d))
+
+(defn- certificate-replies [state peer certs]
+  (mapv (fn [c] (n/send-to peer {:kind :certificate :cert c :from (:peer-id state)}))
+        (sort-by :id certs)))
+
+(defn- answer-want [state peer round digests]
+  (let [ids (into [] (comp (take (count (:validators state)))
+                           (filter #(and (string? %) (= 36 (count %))))
+                           (distinct))
+                  (when (sequential? digests) digests))
+        cached (keep #(stored state %) ids)
+        missing (filterv #(nil? (stored state %)) ids)
+        pending (get-in state [:archive-wants peer])
+        ;; Queue at most one batch per validator. Prefer its oldest missing
+        ;; round, since subsequent certificates depend on that round's parents.
+        queue? (and (:archive-catchup? state) (seq missing) (int? round)
+                    (< 0 round (- (:last-committed-round state) (:store-depth state)))
+                    (or (nil? pending) (< round (:round pending))))]
+    (n/result (cond-> state
+                queue? (assoc-in [:archive-wants peer] {:round round :ids missing})
+                (and queue? (nil? pending)) (update :archive-queue (fnil conj []) peer))
+              (certificate-replies state peer cached))))
+
+(defn- start-archive-read [state]
+  ;; One scan at a time, at most once per gossip tick. FIFO across validators
+  ;; keeps one peer's repeated misses from occupying every scan.
+  (if-let [peer (when-not (:archive-active state) (first (:archive-queue state)))]
+    (let [request (get-in state [:archive-wants peer])
+          token (inc (get state :archive-seq 0))]
+      (n/result (-> state
+                    (assoc :archive-active (assoc request :peer peer :token token)
+                           :archive-seq token
+                           :archive-queue (vec (rest (:archive-queue state))))
+                    (update :archive-wants dissoc peer))
+                [(n/read-durable token (map #(vector :cert %) (:ids request)))]))
+    (n/result state)))
+
+(defn- finish-archive-read [state input]
+  (let [{:keys [token ids peer round]} (:archive-active state)]
+    (if (and token (= token (:token input)))
+      (n/result (dissoc state :archive-active)
+                (certificate-replies
+                 state peer
+                 (keep (fn [id]
+                         (let [c (get (:values input) [:cert id])]
+                           (when (and (= id (:id c)) (= round (cert-round c))) c)))
+                       ids)))
+      (n/result state))))
 
 (defn- quorum-of-parents?
   "Do these parents name >= 2f+1 stake of DISTINCT authors at round r-1?
@@ -599,14 +658,15 @@
   attestation verifies, and it bounds the work to the number of known
   validators however large the message is."
   [state c]
-  (or (zero? (cert-round c))
-      (let [verify (:verify-vote state)
-            hid (header-id (:header c))
-            stake (:stake state)
-            members (filter (fn [[signer _]] (pos? (get stake signer 0))) (:votes c))
-            verified (filter (fn [[signer att]] (verify signer hid att)) members)]
-        (>= (reduce + 0 (map (fn [[signer _]] (get stake signer 0)) verified))
-            (quorum-threshold (:total-stake state))))))
+  (if (zero? (cert-round c))
+    (and (nil? (get-in c [:header :payload])) (empty? (cert-parents c)))
+    (let [verify (:verify-vote state)
+          hid (header-id (:header c))
+          stake (:stake state)
+          members (filter (fn [[signer _]] (pos? (get stake signer 0))) (:votes c))
+          verified (filter (fn [[signer att]] (verify signer hid att)) members)]
+      (>= (reduce + 0 (map (fn [[signer _]] (get stake signer 0)) verified))
+          (quorum-threshold (:total-stake state))))))
 
 (defn well-formed?
   "The checks that need nothing but the certificate itself and the committee.
@@ -620,6 +680,7 @@
   order that happens to succeed."
   [state c]
   (and (map? (:header c))
+       (canonical-parents? (:header c))
        (map? (:votes c))
        (int? (cert-round c))
        (not (neg? (cert-round c)))
@@ -668,9 +729,8 @@
      ;; see the namespace docstring.
      :last-committed (into {} (map (fn [v] [v 0])) validators)
      :last-committed-round 0
-     ;; The archive. Unbounded here; a deployment bounds it the way Narwhal
-     ;; does, by refusing certificates below the GC horizon and pruning behind
-     ;; them. Genesis lives here as well as in the DAG, because the consensus GC
+     ;; The bounded recent certificate window. Genesis lives here as well
+     ;; as in the DAG, because the consensus GC
      ;; empties round 0 as soon as anything commits while round-1 parent
      ;; resolution still needs it.
      :certificates (into {} (map (fn [[_ c]] [(:id c) c])) genesis)
@@ -914,11 +974,13 @@
           ;; at the last durable point, so the newest write landing means every
           ;; earlier one has too -- including the rest of the anchor's sub-DAG
           ;; and the other certificates that supplied its support.
-          persisted (n/persist-then {:writes {[:cert (:id c)] c}
+          persisted (n/persist-then {:writes (cond-> {[:cert (:id c)] c}
+                                               (:new-archive? state)
+                                               (assoc [::ordering-version] 2))
                                      :durable? true
                                      :token [:cert (:id c)]
                                      :then (vec fx1)})
-          {state :state fx2 :effects} (advance-round state)
+          {state :state fx2 :effects} (advance-round (assoc state :new-archive? false))
           ready (->> (vals (:pending state))
                      (filterv #(have-all-parents? state (cert-round %) (cert-parents %)))
                      ;; Sorted so replay does not depend on map iteration order.
@@ -986,11 +1048,14 @@
 (defn- receive-header
   [state header from]
   (cond
-    (not= (:author header) from)
+    (or (not= (:author header) from) (not (contains? (:stake state) from)))
     (n/result (update-in state [:rejected :forged-author] (fnil inc 0)))
 
     (not (and (int? (:round header)) (pos? (:round header))))
     (n/result (update-in state [:rejected :bad-round] (fnil inc 0)))
+
+    (not (canonical-parents? header))
+    (n/result (update-in state [:rejected :malformed] (fnil inc 0)))
 
     (not (have-all-parents? state (:round header) (:parents header)))
     ;; We must not vote for a header whose history we do not hold: signing it
@@ -1090,6 +1155,32 @@
 ;; too, exactly as Narwhal does.
 ;; ============================================================
 
+(defn- check-ordering-version [config state restored certs]
+  (when (seq certs)
+    (when-not (every? #(canonical-parents? (:header %)) certs)
+      (throw (ex-info "Bullshark archive contains noncanonical parents; reconcile its committed history before replay"
+                      {})))
+    (case (get restored [::ordering-version])
+      2 nil
+      nil
+      (let [validators (:validators state)
+            ;; A legacy UUID archive can have come from either platform.
+            ;; On the JVM each UUID half is a signed long, including the
+            ;; low half when two UUIDs have the same most significant bits.
+            legacy-uuid-order (fn [id]
+                                (let [hex (str id)
+                                      sign-rank #(if (contains? #{\8 \9 \a \b \c \d \e \f} %) 0 1)]
+                                  [(sign-rank (nth hex 0)) (subs hex 0 18)
+                                   (sign-rank (nth hex 19)) (subs hex 19)]))]
+        (when (and (nil? (:anchor-fn config))
+                   (or (> (:total-stake state) 2147483647)
+                       (and (every? uuid? validators)
+                            (not= validators (sort-by legacy-uuid-order validators)))))
+          (throw (ex-info "Bullshark legacy archive requires its historical :anchor-fn before replay"
+                          {:validators validators}))))
+      (throw (ex-info "Unsupported Bullshark archive ordering version"
+                      {:version (get restored [::ordering-version])})))))
+
 (defn- restore-dag
   "Re-insert stored certificates into a fresh state, causally.
 
@@ -1159,12 +1250,24 @@
     ;; announces it. Those were the same effect until section 21, which is
     ;; exactly the confusion this declaration exists to prevent.
     {:emits #{:broadcast :send :persist-then :set-timer :cancel-timer
-              :request-value :commit :resync :report-equivocation :log}
+              :request-value :read-durable :commit :resync :report-equivocation :log}
      :topics #{:bullshark}})
 
   (init [_ config]
     (let [validators (n/validator-set config)
-          stake (or (:stake config) (into {} (map (fn [v] [v 1])) validators))
+          stake (or (:stake config) (zipmap validators (repeat 1)))
+          gc-depth (get config :gc-depth 50)
+          retention (store-depth (assoc config :gc-depth gc-depth))
+          _ (when-not (and (map? stake)
+                           (= (set validators) (set (keys stake)))
+                           (every? #(and (int? %) (<= 1 % 4294967295)) (vals stake))
+                           (<= (reduce + 0 (vals stake)) 4294967295))
+              (throw (ex-info "Bullshark needs positive integer stakes for exactly its validators, totaling at most 4294967295"
+                              {:stake stake})))
+          _ (when-not (and (int? gc-depth) (not (neg? gc-depth))
+                           (int? retention) (> retention gc-depth))
+              (throw (ex-info "Bullshark store-depth must exceed a nonnegative gc-depth"
+                              {:store-depth retention :gc-depth gc-depth})))
           ;; REQUIRED, and deliberately not defaulted. A permissive default is
           ;; how the hole this closes came to exist in the first place: the
           ;; check was described in a docstring, nothing implemented it, and
@@ -1180,9 +1283,11 @@
           base (merge (initial-consensus
                        {:validators validators
                         :stake stake
-                        :gc-depth (or (:gc-depth config) 50)
+                        :gc-depth gc-depth
                         :anchor-fn (or (:anchor-fn config) stake-weighted-anchor)})
                       {:peer-id (:peer-id config)
+                       :store-depth retention
+                       :archive-catchup? (true? (:archive-catchup? config))
                        :sign-vote sign-vote
                        :verify-vote verify-vote
                        :round 1
@@ -1210,6 +1315,7 @@
                         (reduce (fn [m [k v]] (assoc m k v)) {}))
           certs (into [] (comp (filter (fn [[k _]] (= :cert (first k)))) (map val))
                       restored)
+          _ (check-ordering-version config base restored certs)
           voted (into {} (comp (filter (fn [[k _]] (= :voted (first k))))
                                (map (fn [[k v]] [(second k) v])))
                       restored)
@@ -1219,6 +1325,7 @@
                                   (map (fn [[k h]] [(second k) {:header h :id (header-id h)}])))
                          restored)
           state (assoc base :voted voted :own-headers proposed
+                       :new-archive? (and (empty? certs) (not (contains? restored [::ordering-version])))
                        ;; Our own signature counts toward certifying our own
                        ;; header, on this side of the crash as on the other.
                        :votes (into {} (map (fn [[r {:keys [id]}]]
@@ -1415,14 +1522,10 @@
             (n/result state [(n/log-effect :debug
                                            {:event :want-from-non-validator
                                             :from from})])
-            (n/result state
-                      (mapv (fn [c] (n/send-to from {:kind :certificate :cert c
-                                                     :from (:peer-id state)}))
-                            (->> (if (sequential? digests) digests [])
-                                 (take (count (:validators state)))
-                                 (keep #(stored state %))
-                                 (sort-by :id)))))
+            (answer-want state from round digests))
           (n/result state)))
+
+      :durable-values (finish-archive-read state input)
 
       :timer-fired
       (case (:timer-id input)
@@ -1446,10 +1549,11 @@
         ;; and never again. Under 50% loss all four nodes ended up holding a
         ;; certified round-3 certificate that none of the others ever saw, and
         ;; the network stopped dead with every node reporting healthy state.
-        (let [own (get-in state [:own-headers (:round state)])
+        (let [{state :state archive-effects :effects} (start-archive-read state)
+              own (get-in state [:own-headers (:round state)])
               mine (stored state (:own-latest state))]
           (n/result state
-                    (into []
+                    (into (vec archive-effects)
                           (concat
                            (when (and own (not (contains? (:pending-votes state)
                                                           [(:peer-id state) (:round state)])))
@@ -1487,6 +1591,7 @@
 
   Config: `:stake` {author stake}, `:gc-depth` n, `:anchor-fn`
   `(fn [round validators stake] -> author)`, `:anchor-wait-ticks` n,
-  `:gossip-ticks` n."
+  `:gossip-ticks` n, `:archive-catchup?` true to serve certificates beyond
+  `:store-depth` from retained durable history."
   []
   (->Bullshark))

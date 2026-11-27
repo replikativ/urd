@@ -211,6 +211,8 @@
     (throw (ex-info "unexpected self-message type: refusing to guess whether it needs an fsync"
                     {:msg msg}))))
 
+(declare vote-payload)
+
 (defn- sign-and-broadcast
   "Sign a message, put it behind the durability barrier, and gate its broadcast
   on the write landing.
@@ -221,12 +223,18 @@
   [st msg]
   (let [candidate {:height (:height msg) :round (:round msg)
                    :step (signed-message-step msg)}]
-    (if-not (signing/may-sign? candidate (:last-signed st))
+    (if-not (and (> (:height st) (:voting-blocked-through st -1))
+                 (contains? (:powers st) (:id st))
+                 (signing/may-sign? candidate (:last-signed st)))
       (log-line st :error
                 (str (:id st) " REFUSING to sign " (:type msg)
                      " at " [(:height msg) (:round msg)]
                      "; last signed " (:last-signed st)))
-      (let [token [:signed (:write-seq st)]]
+      (let [token [:signed (:write-seq st)]
+            msg (cond-> msg
+                  (and (= :precommit (:type msg)) (:sign-vote st))
+                  (assoc :att ((:sign-vote st) (:id st)
+                                               (vote-payload (:height msg) (:round msg) (:value-id msg)))))]
         (-> st
             (assoc :last-signed candidate)
             (update :write-seq inc)
@@ -237,6 +245,8 @@
                         ;; Carried so the write can persist it under its OWN
                         ;; durable key -- see `finish`.
                         :last-signed candidate
+                        :signing-lock {:witness candidate :round (:locked-round st)
+                                       :value-id (:locked-value-id st)}
                         ;; The epoch witness. Tendermint's WAL is append-only,
                         ;; so there is no ABA hazard of the kind etcd-raft
                         ;; guards against; what the witness DOES catch here is
@@ -450,9 +460,6 @@
   the adversary the Ivy model assumes (`tendermint.ivy:379-383`)."
   [st from msg verified-by]
   (cond
-    (not (contains? (set (:validators st)) (:from msg)))
-    (log-line st :warn (str (:id st) " dropping message from non-validator " (:from msg)))
-
     (not (contains? (or verified-by #{}) (:from msg)))
     (log-line st :warn (str (:id st) " dropping message whose author " (:from msg)
                             " was not verified (relayed by " from ")"))
@@ -460,13 +467,16 @@
     ;; Catch-up traffic is ABOUT heights we are not at, so it cannot go through
     ;; `record-message`, which drops anything below our height and buffers only
     ;; a small window above it. Both are still authenticated by the check above.
-    (= :status (:type msg))
+    (and (= :status (:type msg)) (nat-int? (:height msg)))
     (-> st
         (note-peer-height (:height msg))
         (answer-status (:from msg) (:height msg)))
 
     (= :catchup (:type msg))
     (record-catchup st (:from msg) msg)
+
+    (not (contains? (set (:validators st)) (:from msg)))
+    (log-line st :warn (str (:id st) " dropping message from non-validator " (:from msg)))
 
     :else (record-message st msg)))
 
@@ -719,16 +729,9 @@
   [h r vid])
 
 (defn- broadcast-precommit [st vid]
-  (sign-and-broadcast
-   st (cond-> {:type :precommit :from (:id st)
-               :height (:height st) :round (:round st)
-               :value-id vid}
-        ;; Only when a scheme is configured. Absent, everything below is inert
-        ;; and catch-up falls back to f+1 corroboration, which is what this
-        ;; algorithm did before certificates existed.
-        (:sign-vote st)
-        (assoc :att ((:sign-vote st) (:id st)
-                                     (vote-payload (:height st) (:round st) vid))))))
+  (sign-and-broadcast st {:type :precommit :from (:id st)
+                          :height (:height st) :round (:round st)
+                          :value-id vid}))
 
 (defn- broadcast-proposal [st v vr]
   (sign-and-broadcast st {:type :proposal :from (:id st)
@@ -925,7 +928,7 @@
                (assoc :priorities (proposer/advance (:priorities st) (:powers st)))
                (update :future dissoc new-h)
                trim-decisions)
-        st (reduce record-message st buffered)]
+        st (reduce record-message st (filter #(contains? (:powers st) (:from %)) buffered))]
     (start-round st 0)))
 
 (declare corroborated? decide valid-certificate?)
@@ -943,12 +946,16 @@
     ;; filing it first would let a peer that supplies a good certificate also
     ;; contribute a corroboration claim -- harmless here, but the two paths
     ;; should not be able to reinforce each other.
-    (if (valid-certificate? st cert height (value-id decision))
+    (cond
+      (valid-certificate? st cert height (value-id decision))
       (-> st
           (log-line :info (str (:id st) " catching up to height " height
                                " on a verified commit certificate"))
           (assoc-in [:certificates height] cert)
           (decide (:round st) decision))
+      (not (contains? (set (:validators st)) from)) st
+
+      :else
       (let [st (assoc-in st [:catchup-claims height from] decision)]
         (if (corroborated? st height decision)
           (-> st
@@ -969,7 +976,7 @@
   is lagging by more than 1, send Commit\" -- at any lag down to
   `blockStoreBase`."
   [st from h]
-  (if-some [v (get (:decisions st) h)]
+  (if-some [v (when (< h (:height st)) (get (:decisions st) h))]
     (emit st (node/send-to from
                            (cond-> {:type :catchup :from (:id st)
                                     :height h :decision v}
@@ -1075,7 +1082,7 @@
   [st r v]
   (let [h (:height st)
         token [:end-height h]
-        cert (commit-certificate st r (value-id v))]
+        cert (or (get-in st [:certificates h]) (commit-certificate st r (value-id v)))]
     (-> st
         (assoc-in [:decisions h] v)
         (cond-> cert (assoc-in [:certificates h] cert))
@@ -1084,7 +1091,8 @@
                              " at height " h " round " r))
         (update-in [:fx :signed] conj
                    {:token token
-                    :msg {:type :end-height :height h :decision v}
+                    :msg (cond-> {:type :end-height :height h :decision v}
+                           cert (assoc :certificate cert))
                     :epoch [h r]
                     :then [(node/commit [v])]}))))
 
@@ -1442,12 +1450,13 @@
                     (cond-> (assoc boundary
                                    :decisions (:decisions st)
                                    :last-commit (own-messages-at-height st))
+                      (seq (:certificates st)) (assoc :certificates (:certificates st))
                       (:last-signed st) (assoc :last-signed (:last-signed st))))
         st (cond-> st cp? (assoc :checkpointed-through end-h))
-        persists (mapv (fn [{:keys [token msg epoch then last-signed]}]
+        persists (mapv (fn [{:keys [token msg epoch then last-signed signing-lock]}]
                          (let [end? (= :end-height (:type msg))
                                writes (cond-> {:wal msg}
-                                        last-signed (assoc :last-signed last-signed)
+                                        last-signed (assoc :last-signed last-signed :signing-lock signing-lock)
                                         end? (merge boundary))]
                            (node/persist-then
                             (cond-> {:writes writes :durable? true
@@ -1478,6 +1487,7 @@
     :end-height
     (-> acc
         (assoc-in [:decisions (:height msg)] (:decision msg))
+        (cond-> (:certificate msg) (assoc-in [:certificates (:height msg)] (:certificate msg)))
         (assoc :height (inc (:height msg))
                :round 0
                :step :propose
@@ -1563,6 +1573,26 @@
                                           (zipmap joining (repeat penalty)))))
 
       :else durable)))
+
+(defn- check-recovery-membership [durable replayed height]
+  (when (pos? height)
+    (let [{:keys [validators powers priorities]} durable
+          ids (set validators)
+          complete? (and (= (dec height) (:decided-through durable))
+                         (seq ids) (= (count ids) (count validators))
+                         (= ids (set (keys powers)) (set (keys priorities)))
+                         (every? #(and (int? %) (pos? %) (<= % reconfig/max-total-power)) (vals powers))
+                         (<= (reduce + (vals powers)) reconfig/max-total-power)
+                         (every? int? (vals priorities)))
+          ;; Old unreconfigured WALs can establish the genesis schedule by replay.
+          decisions (:decisions replayed)
+          legacy-history? (and (= height (count decisions))
+                               (every? #(and (nat-int? %) (< % height)) (keys decisions))
+                               (not-any? #(seq (:validator-updates %)) (vals decisions)))]
+      (when-not (or complete?
+                    (and (not (or validators powers priorities)) legacy-history?))
+        (throw (ex-info "Tendermint needs a height-matched validator checkpoint"
+                        {:consensus-height height}))))))
 
 (defn- replay-delivery [st delivered]
   (when (and (some? delivered) (not (nat-int? delivered)))
@@ -1711,6 +1741,8 @@
           ;; precedence: the WAL is more recent than the checkpoint that
           ;; truncated it.
           base (cond-> base
+                 (get-in cfg [:restored :durable :certificates])
+                 (assoc :certificates (get-in cfg [:restored :durable :certificates]))
                  (get-in cfg [:restored :durable :decisions])
                  (assoc :decisions (get-in cfg [:restored :durable :decisions]))
                  (get-in cfg [:restored :durable :last-commit])
@@ -1725,37 +1757,31 @@
           ;; equally survives a lost register.
           restored (update replayed :last-signed
                            later-signed (get-in cfg [:restored :durable :last-signed]))
-          ;; The height is restored the same way and for the same reason: from
-          ;; its own durable register, with the WAL-derived value kept only as
-          ;; a floor. A node whose WAL was rotated or truncated at the front
-          ;; used to come back at height 0 and, once catch-up existed, re-commit
-          ;; every height from there -- a duplicate delivery to the application.
-          ;; `:decided-through` is the last height we durably decided, so we
-          ;; resume at the one after it.
-          ;; Where to resume, from whichever source is further along.
-          ;;
-          ;; `:decided-through` is our own durable register. `:delivered-through`
-          ;; is the CONSUMER's count of applied values, and for this algorithm
-          ;; the two are the same fact in different vocabularies: one height
-          ;; decides one value, heights start at 0, so a consumer holding N
-          ;; values has seen heights 0..N-1 and we resume at N.
-          ;;
-          ;; That equivalence is what makes a state-synced JOIN need no
-          ;; separately-trusted number. konserve-sync transfers the
-          ;; application's database; the database knows how many values it
-          ;; applied; that count is the height to start at. Asking the consumer
-          ;; where it is -- which is already how a restart avoids
-          ;; re-delivering -- turns out to be the same question as asking a
-          ;; joiner where to begin.
-          resume (let [reg (some-> (get-in cfg [:restored :durable :decided-through]) inc)
-                       consumer (:delivered-through cfg)]
-                   (cond
-                     (and reg (number? consumer)) (max reg consumer)
-                     (number? consumer) consumer
-                     :else reg))
-          restored (cond-> restored
-                     (and resume (> resume (:height restored)))
-                     (assoc :height resume))
+          boundary-height (some-> (get-in cfg [:restored :durable :decided-through]) inc)
+          history-height (max (or boundary-height 0) (:height replayed))
+          delivered (:delivered-through cfg)
+          ;; A ledger count does not identify the validators or priority schedule.
+          ;; State transfer must install the matching consensus boundary as well.
+          _ (when (and (nat-int? delivered) (> delivered history-height))
+              (throw (ex-info "Tendermint needs a height-matched validator checkpoint for state sync"
+                              {:delivered-through delivered :consensus-height history-height})))
+          _ (check-recovery-membership (get-in cfg [:restored :durable]) replayed history-height)
+          resume boundary-height
+          restored (assoc restored :height history-height)
+          witness (:last-signed restored)
+          lock-register (get-in cfg [:restored :durable :signing-lock])
+          restored (cond
+                     (or (nil? witness) (< (:height witness) history-height)) restored
+                     (and (= history-height (:height witness))
+                          (= witness (:witness lock-register))
+                          (int? (:round lock-register))
+                          (<= -1 (:round lock-register) (:round witness))
+                          (= (= -1 (:round lock-register)) (nil? (:value-id lock-register))))
+                     (assoc restored :locked-round (:round lock-register)
+                            :locked-value-id (:value-id lock-register))
+                     (not= witness (:last-signed replayed))
+                     (assoc restored :voting-blocked-through (:height witness))
+                     :else restored)
           ;; Proposer priorities: READ BACK, not replayed from genesis.
           ;;
           ;; This used to be `(reduce advance p0 (range height))` -- one advance
@@ -1803,6 +1829,7 @@
           st (assoc st :own-messages [])
           st (fresh-fx st)
           st (replay-delivery st (:delivered-through cfg))
+          st (trim-decisions st)
           st (reduce record-message st own)
           st (log-line st :info
                        (str "tendermint " (:id st) " [validators: " validators

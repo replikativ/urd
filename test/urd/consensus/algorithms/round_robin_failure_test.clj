@@ -11,7 +11,8 @@
   - Byzantine inputs"
   (:require [clojure.test :refer [deftest testing is]]
             [urd.consensus.node :as n]
-            [urd.consensus.algorithms.round-robin :as rr]))
+            [urd.consensus.algorithms.round-robin :as rr]
+            [urd.consensus.algorithms.round-robin-test :refer [landed-step]]))
 
 ;; ============================================================
 ;; Test Helpers
@@ -82,7 +83,7 @@
                         :votes (:votes event)}}
     event))
 
-(defn handle-event [impl state event] (n/step impl state (->input event)))
+(defn handle-event [impl state event] (landed-step impl state (->input event)))
 
 (defn initial-state [impl config]
   ;; Attestations are REQUIRED by `init`: a vote here is relayed, so the peer
@@ -540,10 +541,10 @@
           state (assoc (initial-state impl {:peer-id validator-a})
                        :height 7
                        :finalized {0 test-proposal 1 test-proposal})
-          {:keys [effects]} (n/step impl state
-                                    {:type :message-received
-                                     :from validator-c
-                                     :msg {:kind :want-proposal :height 2 :round 0}})
+          {:keys [effects]} (landed-step impl state
+                                         {:type :message-received
+                                          :from validator-c
+                                          :msg {:kind :want-proposal :height 2 :round 0}})
           send-fx (get-effect effects :send)]
       (is (some? send-fx) "a peer behind us must get an answer")
       (is (= validator-c (:to (second send-fx))) "addressed to the asker, not broadcast")
@@ -566,10 +567,10 @@
                      :finalized (into {} (map (fn [h] [h {:snapshot-id [:p h]}]))
                                       (range 3 9)))
         answer (fn [from]
-                 (let [{:keys [effects]} (n/step impl state
-                                                 {:type :message-received
-                                                  :from validator-c
-                                                  :msg {:kind :state-sync :from from}})]
+                 (let [{:keys [effects]} (landed-step impl state
+                                                      {:type :message-received
+                                                       :from validator-c
+                                                       :msg {:kind :state-sync :from from}})]
                    (:msg (second (get-effect effects :send)))))]
     (is (= (set (range 3 9)) (set (keys (:finalized (answer 0)))))
         "a peer at 0 gets everything we hold")
@@ -583,10 +584,10 @@
   (testing "we cannot help a peer that is ahead of us"
     (let [impl (rr/create test-validators)
           state (assoc (initial-state impl {:peer-id validator-a}) :height 3)
-          {:keys [effects]} (n/step impl state
-                                    {:type :message-received
-                                     :from validator-c
-                                     :msg {:kind :want-proposal :height 9 :round 0}})]
+          {:keys [effects]} (landed-step impl state
+                                         {:type :message-received
+                                          :from validator-c
+                                          :msg {:kind :want-proposal :height 9 :round 0}})]
       (is (nil? (get-effect effects :send))
           "answering with our lower height would only mislead it"))))
 
@@ -601,14 +602,14 @@
           ahead (assoc (initial-state impl {:peer-id validator-a})
                        :height 3
                        :finalized {0 test-proposal 1 test-proposal 2 test-proposal})
-          {ahead-fx :effects} (n/step impl ahead
-                                      {:type :message-received
-                                       :from validator-c
-                                       :msg {:kind :want-proposal
-                                             :height (:height stranded) :round 0}})
+          {ahead-fx :effects} (landed-step impl ahead
+                                           {:type :message-received
+                                            :from validator-c
+                                            :msg {:kind :want-proposal
+                                                  :height (:height stranded) :round 0}})
           reply (:msg (second (get-effect ahead-fx :send)))
           {caught :state caught-fx :effects}
-          (n/step impl stranded {:type :message-received :from validator-a :msg reply})]
+          (landed-step impl stranded {:type :message-received :from validator-a :msg reply})]
       (is (= 3 (:height caught)) "the stranded node is carried to the peer's height")
       (is (= 3 (count (filter #(= :commit (first %)) caught-fx)))
           "and commits every height it had missed, in order")

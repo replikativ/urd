@@ -518,21 +518,17 @@
           ;; (Placing it AT the counter makes the step's own new write reuse the
           ;; token, which is an artefact of hand-built state, not a live hazard.)
           st (assoc st
-                    :pending-writes {99 {:epoch 1 :last-index 5 :durable? true}}
+                    :pending-writes {99 {:epoch 1 :last-index 5 :durable? true :self-ack-through 5}}
                     :next-write-token 100
                     :term 7
                     :stable 0
-                    ;; Armed against the very write that is about to complete,
-                    ;; so only the EPOCH guard can save us. Previously this was
-                    ;; a bare index, which the completion satisfied by
-                    ;; arithmetic rather than by attribution.
-                    :self-ack {:through 5 :token 99})
+                    :role :leader)
           {st' :state} (node/step (raft/make) st (node/persisted 99 1))]
       ;; The assertions that matter are about the HARM, not about bookkeeping.
       ;; An earlier version of this test asserted only `(= 0 (:stable st'))` --
       ;; on a field that is written in three places and read in none, so deleting
       ;; the write would have left the test green while the guard did nothing.
-      (is (= {:through 5 :token 99} (:self-ack st'))
+      (is (zero? (get-in st' [:progress :a :match]))
           "a stale completion must NOT let the leader count its own entry durable")
       (is (= 0 (:stable st'))
           "nor advance durability")
@@ -554,15 +550,14 @@
           st (assoc st
                     :term 4
                     :stable 0
-                    :self-ack {:through 9 :token 0}
                     ;; token 0 covers up to index 9 (still in flight),
                     ;; token 1 covers up to index 3 (lands first).
-                    :pending-writes {0 {:epoch 4 :last-index 9 :durable? true}
+                    :pending-writes {0 {:epoch 4 :last-index 9 :durable? true :self-ack-through 9}
                                      1 {:epoch 4 :last-index 3 :durable? true}})
           {st' :state} (node/step (raft/make) st (node/persisted 1 4))]
       (is (= 3 (:stable st'))
           "only the write that actually landed may advance durability")
-      (is (= {:through 9 :token 0} (:self-ack st'))
+      (is (= 9 (get-in st' [:pending-writes 0 :self-ack-through]))
           "the self-ack for index 9 must survive: its write has not landed")
       (is (contains? (:pending-writes st') 0)
           "and the in-flight write must still be outstanding"))))
@@ -607,23 +602,22 @@
                     :role :leader :term 4 :stable 0
                     ;; Armed by the append that carried entries (token 0),
                     ;; which is still in flight.
-                    :self-ack {:through 3 :token 0}
                     ;; Above the outstanding tokens, or this step's own write
                     ;; reuses token 0 and overwrites the record under test.
                     :next-write-token 2
-                    :pending-writes {0 {:epoch 4 :last-index 3 :durable? true}
+                    :pending-writes {0 {:epoch 4 :last-index 3 :durable? true :self-ack-through 3}
                                      ;; A later commit-index-only write: no
                                      ;; entries, correctly not fsynced.
                                      1 {:epoch 4 :last-index 3 :durable? false}})
           {after-buffered :state} (node/step (raft/make) st (node/persisted 1 4))]
-      (is (= {:through 3 :token 0} (:self-ack after-buffered))
+      (is (= 3 (get-in after-buffered [:pending-writes 0 :self-ack-through]))
           "the buffered write carried no entries to the platter, so it cannot
            make the leader's own entries durable")
       (is (= 0 (:stable after-buffered))
           "nor advance durability -- :stable means entries are on OUR disk")
       (let [{after-carrier :state} (node/step (raft/make) after-buffered
                                               (node/persisted 0 4))]
-        (is (nil? (:self-ack after-carrier)) "the carrier releases it")
+        (is (= 3 (get-in after-carrier [:progress :a :match])) "the carrier releases it")
         (is (= 3 (:stable after-carrier)))))))
 
 (deftest a-self-vote-is-released-only-by-the-write-that-carried-it
@@ -1206,3 +1200,92 @@
                                             {:index 7 :validators [:a :c] :outgoing [:a :b]})))]
       (is (= [:a :c] (:validators st)))
       (is (= [:a :b] (:outgoing st))))))
+
+(deftest client-values-cannot-issue-a-joint-leave
+  (let [impl (raft/make)
+        old [:a :b :c]
+        change {:validator-updates [{:id :b :power 0} {:id :c :power 0}
+                                    {:id :d :power 1} {:id :e :power 1}]}
+        propose (fn [state value] (:state (node/step impl state (node/value-ready value))))
+        pending (propose (leader-at old) change)]
+    (doseq [v [{:leave-joint true} (assoc change :leave-joint true)]]
+      (is (= (:log pending) (:log (propose pending v)))))
+    ;; An older leader may already have appended the untyped enter and leave.
+    ;; The previous majority can commit the enter only.
+    (let [legacy-leave {:index 2 :term 1 :data {:leave-joint true}}
+          st (-> pending
+                 (update :log conj legacy-leave)
+                 (assoc-in [:progress :a :match] 2)
+                 (assoc-in [:progress :b :match] 2))
+          [joint _] (#'raft/maybe-commit (#'raft/fresh-fx st))]
+      (is (= 1 (:commit joint)))
+      (is (= old (:outgoing joint)))
+      (is (= 2 (raft/last-index joint)) "the existing leave was recognized")
+      (is (= 2 (:commit (first (#'raft/maybe-commit
+                                (assoc-in joint [:progress :d :match] 2)))))))))
+
+(deftest a-leader-counts-each-local-append-as-its-write-completes
+  (let [impl (raft/make)
+        propose (fn [st v] (:state (node/step impl st (node/value-ready v))))
+        st (reduce propose (leader-at [:a]) [:one :two :three])]
+    (loop [st st, token 0]
+      (when (< token 3)
+        (let [{next-state :state} (node/step impl st (node/persisted token 1))]
+          (is (= (inc token) (:commit next-state)))
+          (is (= (inc token) (get-in next-state [:progress :a :match])))
+          (recur next-state (inc token)))))))
+
+(deftest recovery-reports-a-durable-commit-outside-the-log
+  (doseq [[base commit] [[0 2] [7 6]]]
+    (let [cfg {:peer-id :a :validators [:a]
+               :restored {:writes [{:writes {:log-base base :base-term 1 :entries []}}
+                                   {:writes {:hard-state {:term 1 :commit commit}}}]}}
+          data (try (node/init (raft/make) cfg)
+                    (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= {:event :invalid-hard-state :log-base base :last-index base :commit commit}
+             data)))))
+
+(deftest an-installed-checkpoint-restarts-probing-under-the-same-leader
+  (let [impl (raft/make)
+        cfg {:peer-id :a :validators [:a :b :c] :initial-term 2
+             :initial-log (entries (repeat 9 2)) :initial-commit 7}
+        leader (-> (:state (node/init impl cfg))
+                   (raft/compact 2)
+                   (assoc :role :leader :lead :a)
+                   (assoc-in [:progress :b :next] 1))
+        snapshot (raft/checkpoint-records
+                  (raft/compact (:state (node/init impl (assoc cfg :initial-commit 6
+                                                               :initial-log (entries (repeat 6 2))))) 0))
+        follower (:state (node/init impl {:peer-id :b :validators [:a :b :c]
+                                          :restored {:writes snapshot} :delivered-through 6}))
+        step (fn [st from msg] (node/step impl st (node/message-received from msg #{from})))
+        message (fn [effects kind]
+                  (some (fn [[op {:keys [msg]}]] (when (and (= op :send) (= kind (:type msg))) msg))
+                        effects))
+        hb (step follower :a {:type :heartbeat :term 2 :commit 0})
+        hint (message (:effects hb) :heartbeat-resp)
+        probe (step leader :b hint)
+        app (message (:effects probe) :app)
+        checked (step (:state hb) :a app)
+        probe-write (some #(when (= :persist-then (first %)) (second %)) (:effects checked))
+        proof (message (:then probe-write) :app-resp)
+        resumed (step (:state probe) :b proof)
+        append (message (:effects resumed) :app)
+        appended (step (:state checked) :a append)
+        write (some #(when (= :persist-then (first %)) (second %)) (:effects appended))
+        ack (message (:then write) :app-resp)]
+    (doseq [invalid [(assoc hint :commit 200) (assoc hint :log-term 88) (dissoc hint :commit)]]
+      (is (nil? (message (:effects (step leader :b invalid)) :app))))
+    (is (= [6 2] [(:prev-index app) (:prev-term app)]))
+    (is (zero? (get-in probe [:state :progress :b :match])) "a hint is not an acknowledgement")
+    (is (empty? (:entries app)))
+    (is (= 6 (:index proof)))
+    (is (= [7 8 9] (mapv :index (:entries append))))
+    (let [stale (assoc app :prev-index 5)
+          reply (step (:state hb) :a stale)
+          record (some #(when (= :persist-then (first %)) (second %)) (:effects reply))]
+      (is (:reject? (message (:then record) :app-resp))
+          "a probe older than retained history cannot use the committed-index shortcut"))
+    (is (:durable? write))
+    (is (= 9 (:index ack)))
+    (is (= 9 (get-in (step (:state resumed) :b ack) [:state :progress :b :match])))))

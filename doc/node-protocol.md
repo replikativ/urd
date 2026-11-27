@@ -34,7 +34,7 @@ optional, and enforced by both interpreters.
 
 ## Inputs
 
-Six constructors, in `urd.consensus.node`:
+`urd.consensus.node` defines the following inputs.
 
 | input | meaning |
 |---|---|
@@ -42,6 +42,7 @@ Six constructors, in `urd.consensus.node`:
 | `timer-fired` | a timer id; ticks, never milliseconds |
 | `sampled` | the result of a poll — a **bag**, not a set |
 | `persisted` | a durable write landed; carries an epoch |
+| `durable-values` | the requested keys found in retained local storage, tagged with the request token |
 | `value-ready` | the application answered `:request-value` |
 | `vertex-received` | a DAG vertex arrived and was authenticated |
 
@@ -54,10 +55,9 @@ property urd proved was conditional on an authenticated transport that did not
 exist. Algorithms that care check membership in this set.
 
 `sampled` is a bag because multiplicity is meaningful: a node drawn twice
-should count twice. (Note that both interpreters currently draw uniformly —
-see [portability and limitations](simulator.md#what-the-simulator-does-not-model).)
+counts twice. Snowman supplies the configured voting powers to both interpreters.
 
-## The thirteen effects
+## Effects
 
 `node/all-effects` is the canonical set.
 
@@ -67,6 +67,11 @@ see [portability and limitations](simulator.md#what-the-simulator-does-not-model
 construct for the same reason: a leader appending to its own log must observe
 that append in the same causal position every follower does, and routing it
 through the network would put it somewhere else.
+
+**Historical lookup** — `(n/read-durable token ks)` requests the latest landed
+values for explicit keys. The `:durable-values` response carries the token and
+the values found. A failed optional lookup returns an empty map. Bullshark uses
+this effect to answer requests beyond its in-memory retention window.
 
 **Durability** — `persist-then`.
 

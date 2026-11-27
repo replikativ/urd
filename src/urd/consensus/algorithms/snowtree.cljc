@@ -70,6 +70,13 @@
 (def ^:private hex-vals
   (zipmap "0123456789abcdef" (range 16)))
 
+(defn avalanche-key
+  "Convert a 32-byte lowercase hex ID to the trie key for AvalancheGo's
+  least-significant-bit-first byte order."
+  [id]
+  (when (and (string? id) (= 64 (count id)) (every? hex-vals id))
+    (apply str (mapcat reverse (partition 2 id)))))
+
 (defn- nibble [k i]
   (or (get hex-vals (nth k i))
       (throw (ex-info "snowtree keys must be lowercase hex" {:key k :at i}))))

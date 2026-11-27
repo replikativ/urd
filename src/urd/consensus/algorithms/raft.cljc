@@ -31,8 +31,8 @@
   \"deliver this event to myself\", and routing a self-addressed message through
   `[:send ...]` would send it over the simulated network, where it can be
   delayed, duplicated, or dropped -- a self-ack that the drop-rate can lose is a
-  liveness bug. Instead the node arms `:self-ack` / `:self-vote` on its own
-  state and consumes them when the matching `persisted` event arrives. The
+  liveness bug. Instead the node associates each local append acknowledgement and self-vote
+  with the write that carries it, then consumes it on `persisted`. The
   ordering guarantee is identical (the ack lands after the write is durable,
   before the gated messages go out), and it stays inside the state machine.
 
@@ -189,7 +189,7 @@
 (defn last-term [st] (or (term-at st (last-index st)) 0))
 
 (defn- match-term? [st i t]
-  (= t (term-at st i)))
+  (and (some? t) (= t (term-at st i))))
 
 (defn up-to-date?
   "Raft 5.4.1: is (last-term, last-index) at least as up to date as ours?"
@@ -505,10 +505,15 @@
 ;; Commit
 ;; ============================================================
 
+(defn- leave-joint-entry? [entry]
+  (or (= :leave-joint (:entry-type entry))
+      ;; Older leaders encoded their internal command only in the payload.
+      (and (nil? (:entry-type entry)) (:leave-joint (:data entry)))))
+
 (defn config-entry?
   "Does this entry carry a validator set change?"
   [e]
-  (boolean (seq (:validator-updates (:data e)))))
+  (boolean (or (leave-joint-entry? e) (seq (:validator-updates (:data e))))))
 
 (defn- config-of
   "This node's set as a `reconfig` config.
@@ -562,7 +567,7 @@
   (cond
     ;; LEAVING. The second of the two decisions, and it carries no updates --
     ;; the new set is already installed, this only drops the old half.
-    (:leave-joint (:data e))
+    (leave-joint-entry? e)
     (-> st
         (assoc :outgoing [] :progress (select-keys (:progress st) (:validators st)))
         (assoc-in [:fx :membership-changed?] true)
@@ -755,7 +760,6 @@
         (assoc :lead nil
                :votes {}
                :self-vote nil
-               :self-ack nil
                :progress (into {} (map (fn [p]
                                          [p (cond-> (new-progress (inc li))
                                               (= p (:id st)) (assoc :match li))]))
@@ -814,17 +818,16 @@
   The self-ack stands in for etcd-raft's self-addressed MsgAppResp
   (`raft.go:845`): the leader's own entry counts toward the commit quorum only
   once the write is durable."
-  [st payloads]
-  (let [li (last-index st)
-        ents (vec (map-indexed (fn [i d] {:index (+ li 1 i) :term (:term st) :data d})
-                               payloads))]
-    (-> st
-        (update :log into ents)
-        (assoc-in [:fx :appended?] true)
-        ;; `:through` is the index these entries reach; `:token` is stamped in
-        ;; `finish` with the write that carries them. It used to be a bare
-        ;; index, which is what let any later completion satisfy it.
-        (assoc :self-ack {:through (+ li (count ents)) :token nil}))))
+  ([st payloads] (append-entries st payloads nil))
+  ([st payloads entry-type]
+   (let [li (last-index st)
+         entries (map-indexed (fn [i data]
+                                (cond-> {:index (+ li i 1) :term (:term st) :data data}
+                                  entry-type (assoc :entry-type entry-type)))
+                              payloads)]
+     (-> st
+         (update :log into entries)
+         (assoc-in [:fx :appended?] true)))))
 
 ;; ============================================================
 ;; Vote handling
@@ -908,9 +911,14 @@
   Three outcomes: the append is entirely below our commit index (ack the commit
   index and move on), the append matches and is absorbed, or it conflicts and we
   return a hint that lets the leader skip a whole term."
-  [st from {:keys [prev-index prev-term entries commit]}]
+  [st from {:keys [prev-index prev-term entries commit verify-anchor?]}]
   (cond
-    (< prev-index (:commit st))
+    ;; An installation probe must prove the named anchor still exists and
+    ;; matches, even if our commit moved since we advertised it.
+    (and verify-anchor? (match-term? st prev-index prev-term))
+    (send-msg st from {:type :app-resp :term (:term st) :index prev-index})
+
+    (and (not verify-anchor?) (< prev-index (:commit st)))
     (send-msg st from {:type :app-resp :term (:term st) :index (:commit st)})
 
     (match-term? st prev-index prev-term)
@@ -991,7 +999,8 @@
                   (str "ignoring heartbeat commit " commit " from " from
                        " -- past our last index " (last-index st)
                        "; stale, or our log was truncated by a restart")))
-      (send-msg from {:type :heartbeat-resp :term (:term st)})))
+      (as-> s (send-msg s from {:type :heartbeat-resp :term (:term s)
+                                :commit (:commit s) :log-term (term-at s (:commit s))}))))
 
 ;; ============================================================
 ;; Leader: commit advancement
@@ -1018,11 +1027,11 @@
   [st]
   (if-not (and (= :leader (:role st))
                (seq (:outgoing st))
-               (not (some #(:leave-joint (:data (entry-at st %)))
+               (not (some #(leave-joint-entry? (entry-at st %))
                           (range (inc (:commit st)) (inc (last-index st))))))
     st
     (-> st
-        (append-entries [{:leave-joint true}])
+        (append-entries [{:leave-joint true}] :leave-joint)
         (update-in [:fx :logs] conj
                    (node/log-effect :info {:event :proposing-leave-joint
                                            :validators (:validators st)})))))
@@ -1034,16 +1043,19 @@
   an entry from its OWN term. Counting replicas of an entry from an earlier term
   is exactly the Figure-8 bug."
   [st]
-  (let [acked (into {} (map (fn [[p pr]] [p (:match pr)])) (:progress st))
-        mci (joint-committed-index (:validators st) (:outgoing st []) acked)]
-    (if (and (> mci (:commit st))
-             (= (:term st) (term-at st mci)))
-      ;; The commit may have ratified a joint configuration, in which case the
-      ;; leader now owes the log a leave entry. Placed here rather than in
-      ;; `commit-to` because `commit-to` runs on followers too, and only a
-      ;; leader may append.
-      [(maybe-leave-joint (flush-commits (commit-to st mci))) true]
-      [st false])))
+  (loop [st st, advanced? false]
+    (let [acked (into {} (map (fn [[p pr]] [p (:match pr)])) (:progress st))
+          mci (joint-committed-index (:validators st) (:outgoing st []) acked)]
+      (if (and (> mci (:commit st)) (= (:term st) (term-at st mci)))
+        ;; A previous leader may have left several configuration commands in
+        ;; the log. Each boundary changes the quorum that can commit its suffix.
+        (let [boundary (some (fn [i] (when (config-entry? (entry-at st i)) i))
+                             (range (inc (:commit st)) (inc mci)))
+              st (-> st (commit-to (or boundary mci)) flush-commits maybe-leave-joint)]
+          (if (and boundary (get-in st [:progress (:id st)]))
+            (recur st true)
+            [st true]))
+        [st advanced?]))))
 
 (defn- handle-app-resp
   "`raft.go:1384-1578`."
@@ -1101,14 +1113,25 @@
   miss: a probe sent into a partition sets the pause and no response ever
   arrives to clear it, so without this the peer is throttled forever. This is
   what `heartbeat_resp_recovers_from_probing.txt` exists to catch."
-  [st from]
+  [st from {:keys [commit log-term]}]
   (let [pr (get-in st [:progress from])]
     (if (nil? pr)
       st
-      (let [st (assoc-in st [:progress from :flow-paused?] false)]
-        (if (or (< (:match pr) (last-index st)) (= :probe (:state pr)))
-          (send-append st from)
-          st)))))
+      (let [;; A reinstalled follower may now share an anchor above our old
+            ;; probe. Its hint only selects the next consistency check. Match
+            ;; advances exclusively on the ordinary AppendEntries response.
+            probe? (and (< (dec (:next pr)) (:log-base st))
+                        (integer? commit) (<= (:log-base st) commit (last-index st))
+                        (= log-term (term-at st commit)))
+            st (cond-> (assoc-in st [:progress from :flow-paused?] false)
+                 probe? (update-in [:progress from] assoc :state :probe :next (inc commit)))]
+        (cond
+          probe? (-> st
+                     (assoc-in [:progress from :flow-paused?] true)
+                     (send-msg from {:type :app :term (:term st) :prev-index commit
+                                     :prev-term log-term :entries [] :commit 0 :verify-anchor? true}))
+          (or (< (:match pr) (last-index st)) (= :probe (:state pr))) (send-append st from)
+          :else st)))))
 
 ;; ============================================================
 ;; Term handling and dispatch
@@ -1147,7 +1170,7 @@
 (defn- step-leader [st from msg]
   (case (:type msg)
     :app-resp (handle-app-resp st from msg)
-    :heartbeat-resp (handle-heartbeat-resp st from)
+    :heartbeat-resp (handle-heartbeat-resp st from msg)
     st))
 
 (defn- step-candidate [st from msg]
@@ -1238,28 +1261,6 @@
 ;; cannot do that, because the token names the write that actually carried the
 ;; state.
 
-(defn- consume-self-ack
-  "The leader's own entries became durable. `raft.go:836-845`.
-
-  Fires only for the write that CARRIED the entries, identified by token. The
-  previous rule -- any completion whose last index reached the armed one --
-  fired on the very next buffered write, because `arm-self?` makes `need?` true
-  on every subsequent step and every such write records the current log length
-  as its `:last-index` while carrying no entries at all.
-
-  The token alone is the condition; fsync is NOT an additional one. An append
-  that carries entries is durable by `MustSync` anyway, and requiring it
-  explicitly would break the pre-vote path, where the carrier is correctly
-  buffered because a pre-vote changes neither term nor vote and grants nothing
-  that must survive a crash."
-  [st token]
-  (let [sa (:self-ack st)]
-    (if (and (= :leader (:role st)) sa (= token (:token sa)))
-      (-> st
-          (assoc :self-ack nil)
-          (handle-app-resp (:id st) {:index (:through sa)}))
-      st)))
-
 (defn- consume-self-vote
   "Our own vote became durable, so it may now be counted. `raft.go:1051-1059`.
 
@@ -1332,7 +1333,8 @@
               (cond-> (:durable? w) (update :stable max (:last-index w))
                       (= token (:last-durable-token st)) (dissoc :last-durable-token)
                       (seq (:replies w)) (update-in [:fx :msgs] into (:replies w)))
-              (consume-self-ack token)
+              (cond-> (and (= :leader (:role st)) (:self-ack-through w))
+                (handle-app-resp (:id st) {:index (:self-ack-through w)}))
               (consume-self-vote token)
               ;; Durability just advanced, so entries that were committed but
               ;; not yet on our own disk may now be deliverable. Without this
@@ -1358,7 +1360,7 @@
         new-ents (if (< (:issued st) li)
                    (vec (subvec (:log st) (log-pos st (inc (:issued st)))))
                    [])
-        arm-self? (some #(and % (nil? (:token %))) [(:self-ack st) (:self-vote st)])
+        arm-self? (and (:self-vote st) (nil? (:token (:self-vote st))))
         cp? (boolean (:checkpoint-due? st))
         ;; MustSync (rawnode.go:191-198): entries, vote, or term. A commit-index
         ;; change alone is recoverable by replaying the log, so it is buffered.
@@ -1391,9 +1393,10 @@
         token (:next-write-token st 0)
         st (if need?
              (-> st
-                 (assoc-in [:pending-writes token] {:epoch (:term st)
-                                                    :last-index li
-                                                    :durable? sync?})
+                 (assoc-in [:pending-writes token]
+                           (cond-> {:epoch (:term st) :last-index li :durable? sync?}
+                             (and appended? (= :leader (:role st)))
+                             (assoc :self-ack-through li)))
                  ;; Stamp the carrier onto whatever this write is gating. This
                  ;; write is the carrier by construction: `arm-self?` forces
                  ;; `need?`, so a step that arms a commitment always mints the
@@ -1401,9 +1404,7 @@
                  ;; makes `sync?` true. An already-stamped arm keeps its
                  ;; original carrier -- a later write must not adopt it.
                  (cond->
-                  (and (:self-ack st) (nil? (:token (:self-ack st))))
-                   (assoc-in [:self-ack :token] token)
-                   (and (:self-vote st) (nil? (:token (:self-vote st))))
+                  (and (:self-vote st) (nil? (:token (:self-vote st))))
                    (assoc-in [:self-vote :token] token))
                  (cond-> sync? (assoc :last-durable-token token))
                  (assoc :next-write-token (inc token)))
@@ -1532,7 +1533,11 @@
           log-base (or log-base 0)
           base-term (or base-term 0)
           li (+ log-base (count log))
-          commit (min (or (:commit hard-state) 0) li)
+          commit (or (:commit hard-state) 0)
+          _ (when-not (and (integer? commit) (<= log-base commit li))
+              (throw (ex-info "Raft durable commit lies outside the recovered log"
+                              {:event :invalid-hard-state :commit commit
+                               :log-base log-base :last-index li})))
           ;; How many committed vertices the CONSUMER has already applied.
           ;;
           ;; This is etcd's `Config.Applied`, and the comment further down
@@ -1590,7 +1595,6 @@
               :issued li
               :pending-writes {}
               :next-write-token 0
-              :self-ack nil
               :self-vote nil
               :votes {}
               :progress {}
@@ -1689,6 +1693,12 @@
                        (some? v)
                        (not= v {:payload :none})))
              st
+
+             ;; Reserve the legacy payload spelling as well: older replicas
+             ;; interpret it as a command irrespective of the entry type.
+             (and (map? v) (contains? v :leave-joint))
+             (update-in st [:fx :logs] conj
+                        (node/log-effect :warn {:event :reserved-raft-command}))
 
              ;; ONE AT A TIME, and this is the check the whole safety argument
              ;; rests on -- not the activation point.

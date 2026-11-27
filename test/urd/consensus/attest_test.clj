@@ -9,7 +9,13 @@
             [clojure.core.async :refer [<!!]]
             [urd.consensus.attest :as attest]
             [urd.consensus.node :as n]
-            [urd.consensus.algorithms.round-robin :as rr]))
+            [urd.consensus.store :as store]
+            [urd.consensus.stores.konserve :as disk]
+            [konserve.filestore :as fs]
+            [urd.consensus.algorithms.round-robin :as rr]
+            [urd.consensus.algorithms.round-robin-test :refer [landed-step]])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
 
 ;; ============================================================
 ;; Keys
@@ -137,14 +143,14 @@
           st (:state (n/init impl (merge (scheme kr :v1)
                                          {:peer-id :v1 :validators validators})))
           ;; v1 proposes at height 0 and votes for its own proposal.
-          proposed (n/step impl st {:type :value-ready :value {:snapshot-id "s0"}})
+          proposed (landed-step impl st {:type :value-ready :value {:snapshot-id "s0"}})
           st1 (:state proposed)
           pid (:current-proposal-id st1)
           ;; v2 votes, genuinely.
           att2 ((:sign-vote (scheme kr :v2)) :v2 (rr/vote-payload st1 pid))
-          r (n/step impl st1 {:type :message-received :from :v2
-                              :msg {:kind :vote :proposal-id pid
-                                    :voter :v2 :att att2}})]
+          r (landed-step impl st1 {:type :message-received :from :v2
+                                   :msg {:kind :vote :proposal-id pid
+                                         :voter :v2 :att att2}})]
       (is (some? pid))
       ;; Effects are `[kind payload]` vectors, not maps.
       (is (some #(= :commit (first %)) (:effects r))
@@ -171,9 +177,9 @@
                purpose")))
 
       (testing "and a forged vote from the third validator does not"
-        (let [forged (n/step impl st1 {:type :message-received :from :v3
-                                       :msg {:kind :vote :proposal-id pid
-                                             :voter :v3 :att (byte-array 64)}})]
+        (let [forged (landed-step impl st1 {:type :message-received :from :v3
+                                            :msg {:kind :vote :proposal-id pid
+                                                  :voter :v3 :att (byte-array 64)}})]
           (is (not-any? #(= :commit (first %)) (:effects forged))))))))
 
 ;; ============================================================
@@ -263,3 +269,28 @@
         (is (= (crash-majority 3) (rr/quorum-size (zipmap validators (repeat nil))))
             "the same threshold round-robin itself uses, stated two ways")
         (is (:valid? r) "two of three IS a crash-fault majority")))))
+
+(deftest ^:integration round-robin-recovers-a-real-vote-from-disk
+  (let [dir (Files/createTempDirectory "urd-round-robin-recovery" (make-array FileAttribute 0))
+        path (str dir)
+        kr (keyring)
+        node (rr/create)
+        cfg #(merge (scheme kr :v1) {:peer-id :v1 :validators validators})
+        chosen {:snapshot-id :p}
+        voted (n/step node (:state (n/init node (cfg))) (n/value-ready chosen {:height 0}))
+        record (select-keys (get-in voted [:effects 0 1]) [:writes :durable?])]
+    (try
+      (let [wal (disk/connect-fs-store! path)]
+        (try (is (true? (<!! (store/write! wal record))))
+             (finally (<!! (store/close-store! wal)))))
+      (let [wal (disk/connect-fs-store! path)]
+        (try
+          (let [st (:state (n/init node (assoc (cfg) :restored (<!! (store/restore wal)))))
+                vote (get-in st [:votes :p :v1])
+                verifier (:verify-vote (scheme kr :v2))
+                repeat (n/step node st (n/value-ready {:snapshot-id :another} {:height 0}))]
+            (is (verifier :v1 (rr/vote-payload st :p) vote))
+            (is (= chosen (:current-proposal st)))
+            (is (= [chosen] (keep #(get-in % [1 :msg :proposal]) (:effects repeat)))))
+          (finally (<!! (store/close-store! wal)))))
+      (finally (fs/delete-store path)))))

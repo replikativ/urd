@@ -42,9 +42,14 @@
   A checkpoint replaces the retained log with records supplied by the
   algorithm. Writes, checkpoints and subsequent reads must observe issue
   order. A backend can discard older records once the replacement is durable."
-  (:require #?(:clj  [clojure.core.async :refer [go]]
-               :cljs [clojure.core.async :refer [go]])
+  (:require #?(:clj  [clojure.core.async :refer [go chan put! close!]]
+               :cljs [clojure.core.async :refer [go chan put! close!]])
             [superv.async :refer [go-try- <?-]]))
+
+(defprotocol ReplayStore
+  (update-replay! [this key f]
+    "Atomically apply f to the authentication register at key. Return a channel
+     yielding [old new] after persistence. These registers survive WAL compaction."))
 
 (defprotocol DurableStore
   "Where `persist-then` writes land."
@@ -142,7 +147,18 @@
      (let [records (<?- pending)]
        {:durable (merge-durable records) :writes records}))))
 
-(defrecord MemoryStore [state]
+(defrecord MemoryStore [state replay]
+  ReplayStore
+  (update-replay! [_ key f]
+    (let [result (chan 1)]
+      (put! result
+            (try
+              (let [[before after] (swap-vals! replay update key f)]
+                [(get before key) (get after key)])
+              (catch #?(:clj Exception :cljs :default) e e)))
+      (close! result)
+      result))
+
   DurableStore
 
   (write! [_ record]
@@ -175,7 +191,7 @@
   constructed rather than one you had to drive a node into."
   ([] (memory-store {}))
   ([{:keys [records] :or {records []}}]
-   (->MemoryStore (atom (vec records)))))
+   (->MemoryStore (atom (vec records)) (atom {}))))
 
 (defn records
   "The raw landed records of a `memory-store`. For assertions."

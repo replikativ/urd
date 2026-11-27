@@ -286,14 +286,16 @@
             (update-in [:storage peer-id :writes] conj record)
             (update-in [:pending-persist peer-id] (fnil conj [])
                        {:token token :epoch epoch :then then :at at
+                        :land-at (max at (or (:land-at (peek (get-in sim [:pending-persist peer-id]))) at))
                         :record record})))
 
       :sample
-      (let [{:keys [request-id k from]} params
+      (let [{:keys [request-id k from powers]} params
+            validators (if powers (sort-by str (keys powers)) (:peer-ids sim))
             candidates (if (= from :validators)
-                         (:peer-ids sim)
-                         (vec (sort (remove #{peer-id} (:peer-ids sim)))))
-            [bag rng'] (rng/sample-weighted-bag (:rng sim) candidates (constantly 1) k)]
+                         validators
+                         (vec (remove #{peer-id} validators)))
+            [bag rng'] (rng/sample-weighted-bag (:rng sim) candidates (or powers (constantly 1)) k)]
         (-> sim
             (assoc :rng rng')
             (deliver-local peer-id (node/sampled request-id bag))))
@@ -367,6 +369,12 @@
       :report-equivocation
       (update sim :equivocations conj
               (assoc params :reporter peer-id :tick (:tick sim)))
+
+      :read-durable
+      (deliver-local sim peer-id
+                     (node/durable-values (:token params)
+                                          (select-keys (get-in sim [:storage peer-id :durable])
+                                                       (:keys params))))
 
       :request-value
       (let [value-fn (get-in sim [:config :value-fn])
@@ -479,46 +487,25 @@
        ;; them, so this is belt and braces -- but it is the cheap half of a
        ;; guard whose absence let a dead node put a message on the wire.
        (let [pending (if (live? s peer-id) (get-in s [:pending-persist peer-id] []) [])
-             due (filter #(<= (:at %) t) pending)
-             remaining (vec (remove #(<= (:at %) t) pending))]
-         (reduce (fn [s2 {:keys [token epoch then record]}]
-                   (-> s2
-                       ;; The write is now on disk and survives a crash. This is
-                       ;; the ONLY place durable state grows; a write that was
-                       ;; issued but never completed is genuinely lost, which is
-                       ;; what makes a crash-before-fsync test mean anything.
-                       ;; A checkpoint REPLACES what a restart may see. This
-                       ;; is the whole reason the flag exists, and modelling it
-                       ;; as anything else would make the simulator's crash
-                       ;; tests pass over a log the real store no longer has.
-                       (update-in [:storage peer-id :landed]
-                                  (fn [ls]
-                                    (if-let [cp (:checkpoint record)]
-                                      (vec cp)
-                                      (conj (or ls []) record))))
-                       ;; A checkpoint REPLACES this too, and merging was
-                       ;; wrong in a way that hid bugs rather than causing
-                       ;; them. `:durable` models the last-write-wins view a
-                       ;; restart reconstructs by folding the log; after
-                       ;; `checkpoint!` the old log is GONE, so that fold sees
-                       ;; only the checkpoint's own records. Merging kept every
-                       ;; key any earlier write had ever set, so a checkpoint
-                       ;; that forgot to carry something still restored it from
-                       ;; a record the real store had deleted. Measured: two
-                       ;; mutations that drop load-bearing keys from
-                       ;; Tendermint's checkpoint passed the whole suite.
-                       (update-in [:storage peer-id :durable]
-                                  (fn [d]
-                                    (if-let [cp (:checkpoint record)]
-                                      (reduce merge {} (map :writes cp))
-                                      (merge d (:writes record)))))
-                       ;; The node learns the write landed...
+             due (filter #(and (<= (:at %) t) (not (:acknowledged? %))) pending)
+             landed (take-while #(<= (:land-at %) t) pending)
+             remaining (mapv #(cond-> % (<= (:at %) t) (assoc :acknowledged? true))
+                             (drop (count landed) pending))
+             placed (reduce (fn [state {:keys [record]}]
+                              (if-let [cp (:checkpoint record)]
+                                (-> state
+                                    (assoc-in [:storage peer-id :landed] (vec cp))
+                                    (assoc-in [:storage peer-id :durable] (store/merge-durable cp)))
+                                (-> state
+                                    (update-in [:storage peer-id :landed] (fnil conj []) record)
+                                    (update-in [:storage peer-id :durable] merge (:writes record)))))
+                            (assoc-in s [:pending-persist peer-id] remaining)
+                            landed)]
+         (reduce (fn [state {:keys [token epoch then]}]
+                   (-> state
                        (step-node peer-id (node/persisted token epoch))
-                       ;; ...and only THEN do the gated effects go out. This is
-                       ;; the whole point of the barrier.
                        (interpret-effects peer-id (or then []))))
-                 (assoc-in s [:pending-persist peer-id] remaining)
-                 due)))
+                 placed due)))
      sim
      (:peer-ids sim))))
 

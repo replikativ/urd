@@ -561,3 +561,14 @@
       (is (= {} (get-in s [:storage :a :durable])))
       (is (not-any? #(= :message-received %) (:heard (sim/node-state s :b)))
           "and nothing gated behind that write may reach a peer"))))
+
+(deftest later-buffered-write-cannot-overtake-an-outstanding-fsync
+  (let [s (-> (scribe-sim)
+              (assoc-in [:config :persist-latency] 8)
+              (sim/inject :s {:type :write :durable? true :token :first :writes {:v 1}})
+              (sim/inject :s {:type :write :durable? false :token :second :writes {:v 2}})
+              (sim/run 2))]
+    (is (= [:second] (get-in s [:nodes :s :state :persisted])))
+    (is (empty? (survived s)))
+    (is (= [{:v 1} {:v 2}] (survived (sim/run s 10))))
+    (is (= [{:v 1}] (survived (sim/crash (sim/run s 10) :s))))))

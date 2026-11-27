@@ -22,6 +22,7 @@
             [urd.consensus.node :as n]
             [urd.consensus.algorithms.raft :as raft]
             [urd.consensus.algorithms.nakamoto :as nk]
+            [urd.consensus.algorithms.round-robin :as rr]
             [urd.consensus.algorithms.snowman :as sm]
             [urd.consensus.algorithms.snowtree :as snowtree]
             [urd.consensus.algorithms.bullshark :as bs]
@@ -103,8 +104,8 @@
 
 (deftest the-new-validator-shift-agrees-across-platforms
   (testing "ClojureScript's bit-shift-right is a 32-bit signed shift"
-    (is (= [-1 -7 -9 -18 -1125]
-           (mapv proposer/new-validator-priority [1 7 8 16 1000])))))
+    (is (= [-1 -7 -9 -18 -1125 -2415919104 -154618822656]
+           (mapv proposer/new-validator-priority [1 7 8 16 1000 2147483648 137438953472])))))
 
 (deftest the-double-sign-guard-agrees-across-platforms
   (is (= [false false true true true false]
@@ -237,6 +238,13 @@
           "and the winner is the lower id, which is the sort the code applies")
       (is (not= (nk/header-id x) (nk/header-id y))
           "the two siblings must actually differ, or nothing above is a tie"))))
+
+(deftest snowman-block-identity-and-native-bit-order
+  (is (= "125c60c54e83259a69d4f87bf68dd55bb2731938228948147d9e49178bde0b3a"
+         (sm/block-id {:parent :genesis :height 1 :payload 42})))
+  (let [key (snowtree/avalanche-key (str "81e2" (apply str (repeat 60 "0"))))]
+    (is (= [1 0 0 0 0 0 0 1 0 1 0 0 0 1 1 1]
+           (mapv #(snowtree/bit-at key %) (range 16))))))
 
 (deftest snowman-choice-keys-agree-across-platforms
   (testing "the Tree indexes candidates by the BITS of a derived key, so if the
@@ -475,3 +483,9 @@
       (is (= :duplicate-update
              (:error (rc/apply-updates cfg [{:id :a :power 2} {:id :a :power 3}])))
           "and the rejections are classified the same way on both"))))
+
+(deftest uuid-proposers-use-a-portable-order
+  (let [lo #uuid "01000000-0000-0000-0000-000000000000"
+        hi #uuid "81000000-0000-0000-0000-000000000000"
+        roster {hi nil lo nil}]
+    (is (= [lo hi] (mapv #(rr/get-proposer-id % roster) [0 1])))))

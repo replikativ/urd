@@ -152,6 +152,9 @@
   ([value] {:type :value-ready :value value})
   ([value context] (assoc (value-ready value) :context context)))
 
+(defn durable-values [token values]
+  {:type :durable-values :token token :values values})
+
 (defn vertex-received
   "A vertex (block / certificate / proposal) arrived and was authenticated."
   [vertex]
@@ -269,6 +272,13 @@
   "Ask the application for a payload to propose."
   [context]
   [:request-value {:context context}])
+
+(defn read-durable
+  "Read the latest landed values of these explicit keys. Missing keys are
+   omitted from the local durable-values response. Suitable for optional
+   historical data; a failed lookup can return an empty map."
+  [token ks]
+  [:read-durable {:token token :keys (set ks)}])
 
 (defn commit
   "Commit an ORDERED SEQUENCE of vertices.
@@ -544,6 +554,18 @@
   [n]
   (inc (quot n 2)))
 
+(defn ordered-validator-ids
+  "Order validator IDs identically on the JVM and in JavaScript. In particular,
+  UUIDs use their canonical text, independent of the JVM's signed-long order."
+  [ids]
+  (vec (sort-by (fn [id]
+                  (cond
+                    (uuid? id) [0 (str id)]
+                    (keyword? id) [1 [(or (namespace id) "") (name id)]]
+                    (string? id) [2 id]
+                    :else [3 id]))
+                ids)))
+
 (defn validator-set
   "The validator set from a config, checked.
 
@@ -578,7 +600,7 @@
                              " -- quorum arithmetic counts positions, so a"
                              " duplicate lets one node vote more than once")
                         {:peer-id (:peer-id config) :duplicates dups}))))
-    (vec (sort vs))))
+    (ordered-validator-ids vs)))
 
 (defn byzantine-tolerance
   "f = floor((n-1)/3), the number of Byzantine faults n validators tolerate.
@@ -613,7 +635,7 @@
   so a typo in a capability set is refused rather than silently narrowing what a
   node is allowed to do."
   #{:send :broadcast :deliver-self :persist-then :sample :set-timer :cancel-timer
-    :request-value :commit :revert :resync :report-equivocation :log})
+    :request-value :read-durable :commit :revert :resync :report-equivocation :log})
 
 (defn check-topics
   "Validate and return the set of topics this node broadcasts on.

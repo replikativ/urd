@@ -352,6 +352,11 @@
   [ps]
   (:state (n/init impl {:peer-id :me :validators [:me :p1 :p2 :p3 :p4] :params ps})))
 
+(defn- commits-after-sync [effects]
+  (for [[op write] effects :when (= :persist-then op)
+        effect (:then write) :when (= :commit (first effect))]
+    effect))
+
 (defn- feed [st input] (n/step impl st input))
 
 (defn- add-blocks [st blks]
@@ -369,7 +374,7 @@
                     (feed s (n/message-received peer
                                                 {:kind :chit :request-id rid :preference pref}
                                                 #{peer}))]
-                {:state s' :commits (into cs (filter #(= :commit (first %))) fx)}))
+                {:state s' :commits (into cs (commits-after-sync fx))}))
             {:state st :commits []}
             chits)))
 
@@ -565,7 +570,7 @@
           drained (feed (:state r2) (n/timer-fired [:poll-expire 100]))]
       (is (empty? (:commits r2)) "the earlier incomplete poll holds both results")
       (is (= [:x] (mapcat #(:vertices (n/effect-params %))
-                          (filter #(= :commit (n/effect-kind %)) (:effects drained))))))))
+                          (commits-after-sync (:effects drained))))))))
 
 (deftest a-chit-is-attributed-to-its-authenticated-sender
   (testing "the chit's sender is `(:from input)`, the transport-authenticated
@@ -706,14 +711,15 @@
     (is (= :genesis (:last-accepted forwards)))))
 
 (deftest poll-dependencies-retain-the-request-and-fetch-missing-ancestors
-  (let [s (-> (start unit-params)
-              (add-blocks [{:id :x :parent :genesis :height 1}]))
+  (let [tip-block {:id :tip :parent :middle :height 3}
+        s (-> (start unit-params)
+              (add-blocks [{:id :x :parent :genesis :height 1}])
+              (assoc :verify-block #{tip-block {:id :middle :parent :x :height 2}}))
         s (:state (feed s (n/sampled 100 {:p1 1 :p2 3})))
         one (feed s (chit :p1 100 :tip))
         s (:state (feed (:state one) (chit :p2 100 :x)))
         two (poll s 101 {:p1 3 :p2 1} [[:p1 :tip] [:p2 :x]])
-        tip (feed (:state two) (n/message-received :p1 {:kind :block :block
-                                                        {:id :tip :parent :middle :height 3}}
+        tip (feed (:state two) (n/message-received :p1 {:kind :block :block tip-block}
                                                    #{:p1}))
         done (feed (:state tip) (n/vertex-received {:id :middle :parent :x :height 2}))]
     (is (= [:tip] (fetches one)))
@@ -721,7 +727,7 @@
     (is (= #{:middle} (set (fetches tip))))
     (is (= :genesis (:last-accepted (:state tip))))
     (is (= [:x] (mapcat #(:vertices (n/effect-params %))
-                        (filter #(= :commit (n/effect-kind %)) (:effects done)))))
+                        (commits-after-sync (:effects done)))))
     (is (empty? (:outstanding (:state done))))))
 
 (deftest an-unrecognized-request-id-leaves-outstanding-polls-alone
@@ -782,31 +788,8 @@
   {:k 3 :alpha-preference 2 :alpha-confidence 2 :beta 3})
 
 (def safe-params
-  "For the CONTESTED runs. Snowman's safety is probabilistic and parameterised;
-  the code enforces none of it. Measured over 200 seeds of the contested
-  scenario below, on five nodes with a 2/3 preference split, and re-measured
-  after the Tree became the default variant:
-
-                      diverge      never decide
-      :tree beta 3     21 / 200      0 / 200
-      :tree beta 6      0 / 200      0 / 200
-      :flat beta 3     34 / 200      0 / 200
-      :flat beta 6      0 / 200      0 / 200
-
-  Two things worth reading off that table. The contested property is asserted
-  at beta 6, because at beta 3 divergence is a real property of the algorithm
-  rather than a defect -- calling those failures flaky would be misreading it,
-  and asserting only `agreement?`, which five empty commit logs satisfy, would
-  be worse.
-
-  And the Tree is measurably SAFER at weak parameters, not merely different: 21
-  divergences against flat's 34 on the same 200 seeds. That is the structure
-  earning its place rather than an aesthetic preference for matching the
-  reference. Sibling votes combining above their divergence bit means a
-  contested slot resolves on evidence the flat form discards as a sub-alpha
-  plurality, so honest nodes spend fewer rounds in the metastable region where
-  they can be pushed apart."
-  {:k 3 :alpha-preference 2 :alpha-confidence 2 :beta 6})
+  "Parameters for the contested five-validator scenarios with self-sampling."
+  {:k 5 :alpha-preference 3 :alpha-confidence 3 :beta 6})
 
 (defn- fresh [& [cfg]]
   (sim/make {:seed 3
@@ -877,7 +860,7 @@
             is satisfied by five empty commit logs, which is to say it holds for
             an implementation that does nothing at all; this test asserted only
             that for as long as it existed."
-    (let [s (-> (fresh)
+    (let [s (-> (fresh-with safe-params)
                 (sim/partition-network [#{:a :b} #{:c} #{:d :e}])
                 (sim/inject-all (n/vertex-received {:id :blk1 :parent :genesis :height 1}))
                 (sim/run 120))]
@@ -929,17 +912,7 @@
                          (= 1 (count (distinct decided))))))))
 
 (deftest weak-parameters-really-do-diverge
-  (testing "the flip side, and the reason the property above runs at beta 6.
-
-            Snowman's safety is probabilistic and the code enforces none of it:
-            at k=3 alpha=2 beta=3 on five nodes with a split preference, honest
-            nodes accept conflicting blocks on 21 of the first 200 seeds under
-            the Tree and 34 under the flat form. Asserting
-            that here does two jobs. It records the measurement that chose
-            `safe-params`, so raising beta later is a deliberate act rather than
-            an accident. And it is a mutation control for the detector: if
-            `sim/agreement?` ever stops being able to SEE a divergence, this test
-            goes red while every other test in the file stays green."
+  (testing "a weak sample threshold can yield conflicting accepted blocks"
     (let [diverged (for [seed (range 1 61)
                          :let [decided (remove empty? (vals (sim/all-committed
                                                              (contested sim-params seed 250))))]
@@ -948,3 +921,63 @@
       (is (seq diverged)
           "weak parameters must actually diverge, or `safe-params` is cargo cult
            and `agreement?` may have stopped detecting anything"))))
+
+(deftest wire-blocks-verify-identity-and-parent-height
+  (let [state (start unit-params)
+        parent {:id :parent :height 1 :parent :genesis}
+        state (:state (feed state (n/vertex-received parent)))
+        body {:parent :parent :height 2 :payload 42}
+        block (assoc body :id (sm/block-id body))
+        admit (fn [s b] (:state (feed s (n/message-received :p1 {:kind :block :block b} #{:p1}))))
+        bad-height (assoc body :height 3)]
+    (is (= state (admit state (assoc block :payload 43))))
+    (is (nil? (get-in (admit state (assoc bad-height :id (sm/block-id bad-height)))
+                      [:blocks (sm/block-id bad-height)])))
+    (is (= block (get-in (admit state block) [:blocks (:id block)])))
+    (is (= state (admit state (assoc block :id :opaque))))
+    (is (= state (admit state (assoc block :id :parent))))))
+
+(deftest accepted-blocks-are-durable-before-commit-and-recover-in-order
+  (let [cfg {:peer-id :a :validators [:a] :powers {:a 4}
+             :params (assoc unit-params :beta 1)}
+        initial (:state (n/init impl cfg))
+        block {:id :x :parent :genesis :height 1}
+        st (:state (feed initial (n/vertex-received block)))
+        result (feed st (n/sampled 100 {:a 4}))
+        [_ record] (first (filter #(= :persist-then (first %)) (:effects result)))
+        recovered (fn [cursor]
+                    (n/init impl (assoc cfg :delivered-through cursor
+                                        :restored {:writes [record] :durable (:writes record)})))]
+    (is (empty? (filter #(= :commit (first %)) (:effects result))))
+    (is (:durable? record))
+    (is (= [block] (get-in record [:writes :snowman-accepted])))
+    (is (= [(n/commit [:x])] (:then record)))
+    (is (= :x (get-in (recovered 0) [:state :last-accepted])))
+    (is (some #{(n/commit [:x])} (:effects (recovered 0))))
+    (is (empty? (filter #(= :commit (first %)) (:effects (recovered 1)))))
+    (is (some #{(n/resync [:x])} (:effects (recovered nil))))
+    (is (thrown-with-msg? Exception #"outside its durable history" (recovered 2)))
+    (let [migrated (n/init impl (assoc cfg :accepted-frontier block :delivered-through 1))]
+      (is (= :x (get-in migrated [:state :last-accepted])))
+      (is (= 1 (get-in migrated [:state :commit-index]))))))
+
+(deftest a-valid-chain-beyond-a-thousand-ancestors-still-counts
+  (let [initial (start (assoc unit-params :beta 1 :variant :flat-snowflake))
+        chain (for [i (range 1 1004)] {:id i :parent (if (= 1 i) :genesis (dec i)) :height i})
+        st (add-blocks initial chain)
+        result (poll-all st 100 sample-peers 1003)]
+    (is (= 1003 (:preference st)))
+    (is (= 1003 (get-in result [:state :last-accepted])))
+    (is (= (range 1 1004) (mapcat #(get-in % [1 :vertices]) (:commits result))))))
+
+(deftest a-weighted-validator-can-draw-its-own-stake
+  (let [cfg {:peer-id :a :validators [:a :b] :powers {:a 4 :b 1}
+             :params {:k 5 :alpha-preference 4 :alpha-confidence 4 :beta 1}}
+        sim (-> (sim/make {:nodes {:a impl :b impl}
+                           :node-config {:a cfg :b (assoc cfg :peer-id :b)}})
+                (sim/inject-all (n/vertex-received {:id :x :parent :genesis :height 1}))
+                (sim/run 100))]
+    (is (= [:x] (sim/committed sim :a)))
+    (is (= [:x] (sim/committed sim :b)))
+    (doseq [powers [{:a 1 :b 1} {:a 0 :b 8} {:b 5} {:a 4294967295 :b 1}]]
+      (is (thrown-with-msg? Exception #"positive validator weight" (n/init impl (assoc cfg :powers powers)))))))

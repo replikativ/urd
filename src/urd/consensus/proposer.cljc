@@ -141,4 +141,4 @@
   scope) because it is the one place the reference implementation's arithmetic
   silently does something other than what its comment says."
   [total]
-  (- (+ total (bit-shift-right total 3))))
+  (- (+ total (quot total 8))))

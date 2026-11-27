@@ -101,12 +101,15 @@
             [urd.consensus.node :as n]
             [urd.consensus.algorithms.snowflake :as sf]
             [urd.consensus.algorithms.snowtree :as st]
-            [hasch.core :as hasch]))
+            [hasch.core :as hasch]
+            [urd.wire :as wire]
+            [urd.crypto :as crypto]))
 
-;; Depth guard on every block-tree walk. The block tree is built from untrusted
-;; messages, so a cycle is a thing a peer can send us, not a thing that cannot
-;; happen.
-(def ^:private max-depth 1000)
+(defn block-id
+  "SHA-256 of the canonical CBOR block fields excluding :id. This is the
+  default identity check for blocks fetched from other validators."
+  [block]
+  (crypto/bytes->hex (hasch/sha256 (wire/signing-bytes (dissoc block :id)))))
 
 ;; ============================================================
 ;; The polling instance
@@ -145,9 +148,14 @@
 
 (defn- variant [params] (:variant params :tree))
 
+(defn- instance-key [params choice]
+  (if (= :avalanche (:tree-key-mode params))
+    (st/avalanche-key choice)
+    (choice-key choice)))
+
 (defn- instance-new [params choice]
   (case (variant params)
-    :tree (st/tree params choice (choice-key choice))
+    :tree (st/tree params choice (instance-key params choice))
     :flat-snowflake (sf/snowflake params choice)
     :flat-snowball (sf/snowball params choice)))
 
@@ -161,7 +169,7 @@
   invisible to the poll."
   [inst params choice]
   (case (variant params)
-    :tree (st/tree-add inst choice (choice-key choice))
+    :tree (st/tree-add inst choice (instance-key params choice))
     inst))
 
 (defn- instance-record-poll
@@ -173,7 +181,7 @@
   [inst params child-votes]
   (case (variant params)
     :tree (st/tree-record-poll inst child-votes)
-    (let [[choice votes] (apply max-key val (sort-by key child-votes))]
+    (let [[choice votes] (apply max-key val child-votes)]
       (case (variant params)
         :flat-snowflake (sf/snowflake-record-poll inst votes choice)
         :flat-snowball (sf/snowball-record-poll inst votes choice)))))
@@ -228,6 +236,9 @@
     ;; and dropping it would strand the whole branch permanently.
     (assoc-in state [:orphans id] blk)
 
+    (not= (:height blk) (inc (get-in state [:blocks parent :height])))
+    (update state :orphans dissoc id)
+
     :else
     (-> state
         (update :orphans dissoc id)
@@ -244,11 +255,11 @@
 (defn- add-block
   "Insert `blk`, then keep re-offering the held orphans until none lands."
   [state blk]
-  (loop [st (add-one state blk), guard 0]
+  (loop [st (add-one state blk)]
     (let [st' (reduce add-one st (vals (:orphans st)))]
-      (if (or (= (:blocks st') (:blocks st)) (>= guard max-depth))
+      (if (= (:blocks st') (:blocks st))
         st'
-        (recur st' (inc guard))))))
+        (recur st')))))
 
 (defn- resolve-path
   "Walk from `id` up to `stop`, reporting WHY the walk failed.
@@ -265,14 +276,14 @@
   that chitted it (`engine.go:709-722`) and schedules the vote against it
   (`:396-415`)."
   [state id stop]
-  (loop [cur id, acc ()]
+  (loop [cur id, acc (), visited #{}]
     (cond
       (= cur stop) {:path (vec acc)}
       (nil? cur) nil
-      (> (count acc) max-depth) nil
+      (contains? visited cur) nil
       (contains? (:rejected state) cur) nil
       :else (if-let [block (or (get-in state [:blocks cur]) (get-in state [:orphans cur]))]
-              (recur (:parent block) (conj acc cur))
+              (recur (:parent block) (conj acc cur) (conj visited cur))
               {:missing cur}))))
 
 (defn- path-below
@@ -309,7 +320,7 @@
                   (update :polls-run inc)
                   (assoc-in [:outstanding rid] {:issued (inc (:polls-run state))}))
               [(n/set-timer [:poll-expire rid] (:poll-timeout state))
-               (n/sample rid (get-in state [:params :k]) :peers)])))
+               (assoc-in (n/sample rid (get-in state [:params :k]) :validators) [1 :powers] (:powers state))])))
 
 (defn- bubble
   "Turn chits into per-parent vote counts: {parent {child votes}}.
@@ -356,11 +367,11 @@
   acceptance rejects the losing siblings and their subtrees
   (`acceptPreferredChild`, `topological.go:645-665`)."
   [state]
-  (loop [st state, commits [], guard 0]
+  (loop [st state, accepted []]
     (let [la (:last-accepted st)
           sb (get-in st [:snowballs la])]
-      (if-not (and sb (instance-finalized? sb (:params st)) (< guard max-depth))
-        [st commits]
+      (if-not (and sb (instance-finalized? sb (:params st)))
+        [st accepted]
         (let [choice (instance-preference sb (:params st))
               idx (:commit-index st)
               siblings (disj (get-in st [:children la] #{}) choice)
@@ -371,7 +382,7 @@
                      (assoc :last-accepted choice)
                      (update :accepted conj choice)
                      (assoc :commit-index (inc idx)))]
-          (recur st (conj commits (n/commit [choice])) (inc guard)))))))
+          (recur st (conj accepted (get-in st [:blocks choice]))))))))
 
 (defn- preferred-tip
   "Walk down the preferred branch to a leaf (`topological.go:296-311`).
@@ -380,25 +391,29 @@
   the tally puts it -- would mean every completed poll pulled preference back
   from the tip, capping the chain at one block per round."
   [state]
-  (loop [cur (:last-accepted state), guard 0]
+  (loop [cur (:last-accepted state)]
     (let [inst (get-in state [:snowballs cur])]
-      (if (and inst (< guard max-depth))
-        (recur (instance-preference inst (:params state)) (inc guard))
+      (if inst
+        (recur (instance-preference inst (:params state)))
         cur))))
 
 (defn- tally
   "Apply a set of chits and settle the consequences."
   [state chits weights]
   (let [state (record-votes state (bubble state chits weights))
-        [state commits] (accept-finalized state)]
-    [(assoc state :preference (preferred-tip state)) commits]))
+        [state accepted] (accept-finalized state)]
+    [(assoc state :preference (preferred-tip state))
+     (when (seq accepted)
+       [(n/persist-then {:writes {:snowman-root (:root state) :snowman-accepted accepted}
+                         :durable? true :epoch 0
+                         :then [(n/commit (mapv :id accepted))]})])]))
 
 (defn- bound-dependencies
   "Drop the oldest unresolved replies over the configured age or size bounds."
   [state effects]
   (let [cutoff (- (:polls-run state) (:deferred-ttl state))
         waiting (for [[rid poll] (:outstanding state)
-                      peer (sort (keys (:waiting poll)))]
+                      peer (sort-by str (keys (:waiting poll)))]
                   [rid peer])
         expired (take-while (fn [[rid _]] (< (get-in state [:outstanding rid :issued]) cutoff))
                             waiting)
@@ -434,8 +449,18 @@
       :else [state []])))
 
 (defn- receive-block
-  [state block]
-  (if (or (nil? (:id block)) (get-in state [:blocks (:id block)]))
+  [state block remote?]
+  (if (or (not (map? block)) (nil? (:id block)) (nil? (:parent block))
+          (= (:id block) (:parent block))
+          (and (= :avalanche (get-in state [:params :tree-key-mode]))
+               (nil? (st/avalanche-key (:id block))))
+          (not (and (integer? (:height block)) (pos? (:height block))))
+          (get-in state [:blocks (:id block)])
+          ;; Local vertex inputs come from the application VM. Wire blocks
+          ;; must verify against their advertised identity before staging.
+          (if-let [verify (:verify-block state)]
+            (not (verify block))
+            (and remote? (not= (:id block) (block-id block)))))
     (n/result state)
     (let [st (add-block state block)
           waiting (for [[rid poll] (:outstanding st)
@@ -491,14 +516,12 @@
   n/Node
 
   (capabilities [_]
-    ;; The only algorithm here that emits `:sample`, and the only one that
-    ;; emits no `:persist-then` at all -- Snowman has no durable state and
-    ;; nothing it signs, so there is no binding commitment to gate.
+    ;; Accepted blocks must survive a crash before their IDs reach the consumer.
     ;;
     ;; No `:revert`, despite finality being PROBABILISTIC. Those are different
     ;; axes: acceptance here is absorbing, so a consumer needs no code for
     ;; revocation even though it needs an assumption about parameters.
-    {:emits #{:send :sample :set-timer :cancel-timer :commit :log}})
+    {:emits #{:send :sample :set-timer :cancel-timer :commit :persist-then :resync :log}})
 
   (init [_ config]
     (let [genesis (or (:genesis config) :genesis)
@@ -509,36 +532,71 @@
       ;; forms above would throw anyway, but far from here and with nothing
       ;; naming the cause -- and a silent default would be worse still, since
       ;; the three shapes differ in how much of a poll's evidence they use.
+      (when-not (#{:derived :avalanche} (:tree-key-mode params :derived))
+        (throw (ex-info "Unknown Snowtree key mode" {:mode (:tree-key-mode params)})))
       (when-not (contains? variants (variant params))
         (throw (ex-info "unknown snowman variant"
                         {:variant (:variant params) :known variants})))
-      (n/result {:peer-id (:peer-id config)
-                 :peers (n/validator-set config)
-                 :params params
-                 :poll-interval (:poll-interval config 2)
-                 :poll-timeout (:poll-timeout config default-poll-timeout)
-                 :blocks {genesis {:id genesis :parent nil :height 0}}
-                 :children {}
-                 :snowballs {}
-                 :orphans {}
-                 :accepted #{genesis}
-                 :rejected #{}
-                 :last-accepted genesis
-                 :preference genesis
-                 :commit-index 0
-                 :next-request 0
-                 :outstanding (sorted-map)
-                 :last-polled -1
+      (let [validators (n/validator-set config)
+            powers (or (:powers config) (zipmap validators (repeat 1)))
+            _ (when-not (and (= (set validators) (set (keys powers)))
+                             (every? #(and (integer? %) (< 0 % 4294967296)) (vals powers))
+                             (<= (:k params) (reduce + (vals powers)) 4294967295))
+                (throw (ex-info "Snowman needs enough positive validator weight for a full sample"
+                                {:k (:k params) :powers powers})))
+            restored (:restored config)
+            root (or (get-in restored [:durable :snowman-root]) (:accepted-frontier config)
+                     {:id genesis :parent nil :height 0})
+            _ (when-not (and (some? (:id root)) (integer? (:height root)) (<= 0 (:height root)))
+                (throw (ex-info "Invalid Snowman accepted frontier" {:frontier root})))
+            history (into [] (mapcat #(get-in % [:writes :snowman-accepted])) (:writes restored))
+            blocks (loop [blocks {(:id root) root}, parent root, remaining (seq history)]
+                     (if-let [block (first remaining)]
+                       (if (and (= (:parent block) (:id parent))
+                                (= (:height block) (inc (:height parent)))
+                                (some? (:id block)) (not (contains? blocks (:id block))))
+                         (recur (assoc blocks (:id block) block) block (next remaining))
+                         (throw (ex-info "Broken Snowman accepted history" {:block block})))
+                       blocks))
+            frontier (or (peek history) root)
+            cursor (:delivered-through config)
+            _ (when (or (and (some? cursor)
+                             (not (and (integer? cursor) (<= (:height root) cursor (:height frontier)))))
+                        (and (nil? cursor) (pos? (:height root))))
+                (throw (ex-info "Snowman consumer cursor falls outside its durable history"
+                                {:cursor cursor :root (:height root) :frontier (:height frontier)})))
+            recovery (cond
+                       (and cursor (< cursor (:height frontier)))
+                       [(n/commit (mapv :id (subvec history (- cursor (:height root)))))]
+
+                       (and (nil? cursor) (seq history)) [(n/resync (mapv :id history))])]
+        (n/result {:peer-id (:peer-id config)
+                   :peers validators :powers powers :root root :verify-block (:verify-block config)
+                   :params params
+                   :poll-interval (:poll-interval config 2)
+                   :poll-timeout (:poll-timeout config default-poll-timeout)
+                   :blocks blocks
+                   :children {}
+                   :snowballs {}
+                   :orphans {}
+                   :accepted (set (keys blocks))
+                   :rejected #{}
+                   :last-accepted (:id frontier)
+                   :preference (:id frontier)
+                   :commit-index (:height frontier)
+                   :next-request 0
+                   :outstanding (sorted-map)
+                   :last-polled -1
                  ;; Votes waiting on a block we have asked for. Bounded both
                  ;; ways: an unbounded pool is a leak an adversary can drive by
                  ;; chitting block ids that do not exist. Aged in POLLS rather
                  ;; than ticks, because polls are what this algorithm counts.
-                 :polls-run 0
-                 :deferred-ttl (or (:deferred-ttl config) 20)
-                 :deferred-limit (or (:deferred-limit config) 256)}
+                   :polls-run 0
+                   :deferred-ttl (or (:deferred-ttl config) 20)
+                   :deferred-limit (or (:deferred-limit config) 256)}
                 ;; Poll periodically. Snowman has no leader to drive rounds, so
                 ;; the timer IS the engine.
-                [(n/set-timer :poll 2)])))
+                  (conj (vec recovery) (n/set-timer :poll 2))))))
 
   (step [_ state input]
     (case (:type input)
@@ -547,7 +605,7 @@
       ;; which `preferred-tip` picks up: the new block's parent gets an instance
       ;; preferring it, so if the parent was the tip, the tip moves down.
       :vertex-received
-      (receive-block state (:vertex input))
+      (receive-block state (:vertex input) false)
 
       :timer-fired
       (let [tid (:timer-id input)]
@@ -578,14 +636,17 @@
             reserved (get-in state [:outstanding rid])]
         (if (or (<= rid (:last-polled state)) (:weights reserved) (:closed? reserved))
           (n/result state)
-          (let [st (cond-> (assoc-in state [:outstanding rid]
-                                     {:weights peers :chits {} :votes {} :waiting {}
+          (let [self (:peer-id state)
+                local (if (contains? peers self) {self (:preference state)} {})
+                remotes (dissoc peers self)
+                st (cond-> (assoc-in state [:outstanding rid]
+                                     {:weights peers :chits local :votes local :waiting {}
                                       :issued (:issued reserved (inc (:polls-run state)))
-                                      :closed? (empty? peers)})
+                                      :closed? (empty? remotes)})
                      (nil? reserved) (update :polls-run inc))
                 queries (mapv (fn [p] (n/send-to p {:kind :query :request-id rid
                                                     :from (:peer-id state)}))
-                              (sort (keys peers)))]
+                              (sort-by str (keys remotes)))]
             (drain-polls st
                          (cond-> queries (nil? reserved)
                                  (conj (n/set-timer [:poll-expire rid] (:poll-timeout state))))))))
@@ -612,7 +673,7 @@
             (n/result state [(n/send-to sender {:kind :block :block blk})])
             (n/result state))
 
-          :block (receive-block state (:block (:msg input)))
+          :block (receive-block state (:block (:msg input)) true)
 
           :chit
           (let [out (when (integer? request-id) (get-in state [:outstanding request-id]))]
@@ -629,6 +690,14 @@
       (n/result state))))
 
 (defn create
-  "Create a Snowman node."
+  "Create a Snowman node. A :verify-block predicate validates application IDs
+  and content. Configure :params {:tree-key-mode :avalanche} to traverse
+  32-byte hexadecimal IDs in AvalancheGo byte/bit order. Without a verifier, fetched blocks use block-id and locally supplied
+  vertices come from the application VM. :powers sets positive voting weights
+  for all validators (unit weight by default).
+
+  Supply the application's durable :delivered-through cursor for suffix replay.
+  An application migrating older decisions can supply its trusted
+  :accepted-frontier block and matching cursor."
   []
   (->Snowman))

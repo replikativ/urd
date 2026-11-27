@@ -71,6 +71,8 @@
   (:require [org.replikativ.geheimnis.sign :as sign]
             [urd.crypto :as crypto]
             [urd.wire :as wire]
+            [urd.consensus.store :as store]
+            [superv.async :refer [go-try- <?-]]
             #?(:clj  [clojure.core.async :refer [go <!]]
                :cljs [clojure.core.async :refer [go <!]])))
 
@@ -93,7 +95,7 @@
 (defn fresh?
   "Is `sq` a sequence number we have not already accepted from this peer?"
   [{:keys [highest seen] :or {highest -1 seen #{}}} sq]
-  (and (number? sq)
+  (and (integer? sq) (< 0 sq 9007199254740992)
        (> sq (- highest window-size))
        (not (contains? seen sq))))
 
@@ -187,39 +189,43 @@
      and a sequence number this peer has already used. The last is STATEFUL, so
      an authenticator is not a value you can share between nodes."))
 
-(defrecord Ed25519Auth [chain peer-id private-key public-keys next-seq windows]
+(defn- update-register! [registers key f]
+  (go-try-
+   (try
+     (let [result (<?- (store/update-replay! registers key f))]
+       (when-not (and (vector? result) (= 2 (count result))
+                      (= (second result) (f (first result))))
+         (throw (ex-info "Invalid replay register acknowledgement" {})))
+       result)
+     (catch #?(:clj Exception :cljs :default) e
+       (throw (ex-info "Could not persist authentication state" {::store-error true} e))))))
+
+(defrecord Ed25519Auth [chain peer-id private-key public-keys registers windows]
   MessageAuth
 
   (seal [_ msg {:keys [topic to]}]
-    (go (let [sq  (swap! next-seq inc)
-              sig (<! (sign/sign private-key
-                                 (digest chain peer-id topic to sq msg)))]
-          {:msg msg :from peer-id :topic topic :to to :seq sq
-           :sig (crypto/bytes->base64 sig)})))
+    (go-try-
+     (let [[_ sq] (<?- (update-register! registers [chain peer-id :send]
+                                         (fnil inc 0)))
+           _ (when (> sq 9007199254740991)
+               (throw (ex-info "Envelope sequence exhausted" {:peer-id peer-id})))
+           sig (<?- (sign/sign private-key (digest chain peer-id topic to sq msg)))]
+       {:msg msg :from peer-id :topic topic :to to :seq sq
+        :sig (crypto/bytes->base64 sig)})))
 
   (unseal [_ {:keys [msg from topic to sig] sq :seq}]
-    (go
-      ;; An unknown author is refused before any crypto runs: verification is
-      ;; the expensive half, and a peer that is not in the set cannot be
-      ;; authorised however good its signature is.
-      (when-let [pk (get public-keys from)]
-        (when (and (string? sig)
-                   ;; A malformed signature is a packet that never happened,
-                   ;; not an exception that kills the receive loop. Anyone who
-                   ;; can reach the port can send arbitrary bytes, so garbage
-                   ;; in this field is an expected input, not a bug.
-                   ;;
-                   ;; Freshness is checked BEFORE the signature, deliberately:
-                   ;; the window check is a set lookup and verification is an
-                   ;; Ed25519 operation, so a replay flood is rejected at the
-                   ;; cheap end. It does mean an unverified `:seq` can advance
-                   ;; nothing -- `remember` runs only after the signature
-                   ;; holds, below -- so a forged sequence number cannot push a
-                   ;; peer's window forward and lock out its real messages.
-                   (fresh? (get @windows from) sq)
-                   (<! (try-verify pk (digest chain from topic to sq msg) sig)))
-          (swap! windows update from remember sq)
-          {:from from :msg msg :verified-by #{from}})))))
+    (go-try-
+     (when-let [pk (get public-keys from)]
+       (when (and (string? sig) (integer? sq) (< 0 sq 9007199254740992)
+                  (fresh? (get @windows from) sq)
+                  (<! (try-verify pk (digest chain from topic to sq msg) sig)))
+         (let [[before after] (<?- (update-register!
+                                    registers [chain peer-id :receive from]
+                                    (fn [window]
+                                      (if (fresh? window sq) (remember window sq) window))))]
+           (swap! windows assoc from after)
+           (when (fresh? before sq)
+             {:from from :msg msg :verified-by #{from}})))))))
 
 (defrecord NoAuth [peer-id]
   MessageAuth
@@ -257,26 +263,29 @@
 
   Throws on a partial configuration. A node that cannot verify its peers should
   refuse to start, not start and trust them."
-  [config peer-id]
-  (cond
-    (= :none config) (->NoAuth peer-id)
+  ([config peer-id] (authenticator config peer-id (store/memory-store)))
+  ([config peer-id backend]
+   (cond
+     (= :none config) (->NoAuth peer-id)
 
-    (map? config)
-    (let [{:keys [chain private-key public-keys]} config
-          peer-id (or (:peer-id config) peer-id)]
-      (when-not (and chain peer-id private-key (seq public-keys))
-        (throw (ex-info (str "auth needs :chain, :peer-id, :private-key and "
-                             ":public-keys -- or :none to opt out deliberately")
-                        {:missing (remove #(get config %)
-                                          [:chain :peer-id :private-key :public-keys])})))
+     (map? config)
+     (let [{:keys [chain private-key public-keys]} config
+           peer-id (or (:peer-id config) peer-id)]
+       (when-not (and chain peer-id private-key (seq public-keys))
+         (throw (ex-info (str "auth needs :chain, :peer-id, :private-key and "
+                              ":public-keys -- or :none to opt out deliberately")
+                         {:missing (remove #(get config %)
+                                           [:chain :peer-id :private-key :public-keys])})))
       ;; The counter and the replay windows are STATE, so an authenticator
       ;; belongs to exactly one node. Sharing one between peers in a test would
       ;; make them share a sequence space and reject each other's traffic.
-      (->Ed25519Auth chain peer-id private-key public-keys
-                     (atom 0) (atom {})))
+       (let [registers (or (:replay-store config) backend)]
+         (when-not (satisfies? store/ReplayStore registers)
+           (throw (ex-info "Ed25519 requires a ReplayStore via :store or :auth :replay-store" {})))
+         (->Ed25519Auth chain peer-id private-key public-keys registers (atom {}))))
 
-    :else
-    (throw (ex-info "auth must be a config map or :none" {:got config}))))
+     :else
+     (throw (ex-info "auth must be a config map or :none" {:got config})))))
 
 (defn generate-keypair
   "A fresh Ed25519 keypair. Returns a channel of `{:public :private}`.

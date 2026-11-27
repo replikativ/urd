@@ -14,8 +14,9 @@
   audits of the algorithms."
   (:require [clojure.test :refer [deftest testing is]]
             [urd.consensus.auth :as auth]
+            [urd.consensus.store :as store]
             [clojure.edn :as edn]
-            [clojure.core.async :refer [<!!]]))
+            [clojure.core.async :refer [<!! chan close!]]))
 
 (def ctx
   "What the transport is about to do with a message. Both fields are SIGNED --
@@ -235,3 +236,28 @@
       (let [honest (<!! (auth/seal (:a auth) {:kind :vote} ctx))]
         (is (some? (<!! (auth/unseal (:b auth) honest)))
             "and :a can still be heard afterwards")))))
+
+(deftest replay-registers-survive-restart-and-claim-once
+  (let [kp (keypair)
+        backend (store/memory-store)
+        make-auth #(auth/authenticator {:chain :test :private-key (:private kp)
+                                        :public-keys {:a (:public kp)}} % backend)
+        first-env (<!! (auth/seal (make-auth :a) {:n 1} ctx))
+        b (make-auth :b)
+        claims (mapv (fn [_] (auth/unseal b first-env)) (range 8))]
+    (is (= 1 (count (keep <!! claims))))
+    (let [restarted (make-auth :b)
+          second-env (<!! (auth/seal (make-auth :a) {:n 2} ctx))]
+      (is (< (:seq first-env) (:seq second-env)))
+      (is (nil? (<!! (auth/unseal restarted first-env))))
+      (is (= {:n 2} (:msg (<!! (auth/unseal restarted second-env))))))))
+
+(deftest missing-register-acknowledgement-prevents-delivery
+  (let [{:keys [auth keys]} (cluster :test [:a :b])
+        broken (reify store/ReplayStore
+                 (update-replay! [_ _ _] (doto (chan) close!)))
+        receiver (auth/authenticator {:chain :test :private-key (:private (:b keys))
+                                      :public-keys {:a (:public (:a keys))}}
+                                     :b broken)
+        env (<!! (auth/seal (:a auth) {} ctx))]
+    (is (::auth/store-error (ex-data (<!! (auth/unseal receiver env)))))))

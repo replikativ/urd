@@ -76,57 +76,35 @@
                (<? supervisor (pubsub/publish! @peer-atom topic msg))
                true)))
 
-  (subscribe! [this topic handler]
+  (subscribe! [_ topic handler]
     (go-try- supervisor
-      ;; Register in subscriptions map
-             (swap! subscriptions assoc topic handler)
-
              (let [peer @subscribe-peer-atom
-                   pubsub-state (or (:pubsub @peer) {})
-                   has-out? (contains? pubsub-state :out)]
-
-               (if has-out?
-          ;; Client peer: use standard pubsub/subscribe!
-                 (<? supervisor
-                     (pubsub/subscribe! peer #{topic}
-                                        {:strategies {topic (consensus-strategy handler)}}))
-
-          ;; Server peer: create local subscription channel and add as subscriber
-                 (let [local-sub-ch (chan 100)
-                       strategy (consensus-strategy handler)]
-            ;; Add local channel as a subscriber transport
-                   (swap! peer update-in [:pubsub :topics topic :subscribers]
-                          (fnil conj #{}) local-sub-ch)
-
-            ;; Listen on local channel and forward to handler
-                   (go-loop-try supervisor [msg (<? supervisor local-sub-ch)]
+                   client? (contains? (:pubsub @peer) :out)
+                   local-ch (when-not client? (chan 100))
+                   handle {:topic topic :handler handler :local-channel local-ch}]
+               (if client?
+                 (<? supervisor (pubsub/subscribe! peer #{topic}
+                                                   {:strategies {topic (consensus-strategy handler)}}))
+                 (do
+                   (swap! peer update-in [:pubsub :topics topic :subscribers] (fnil conj #{}) local-ch)
+                   (go-loop-try supervisor [msg (<? supervisor local-ch)]
                                 (when msg
-                                  (let [{:keys [payload]} msg]
-                  ;; Apply the strategy's publish handler
-                                    (<? supervisor (proto/-apply-publish strategy payload)))
-                                  (recur (<? supervisor local-sub-ch)))))))
+                                  (handler (:payload msg))
+                                  (recur (<? supervisor local-ch))))))
+               (swap! subscriptions assoc topic handle)
+               handle)))
 
-      ;; Return subscription handle
-             {:topic topic :handler handler}))
-
-  (unsubscribe! [this topic handle]
+  (unsubscribe! [_ topic handle]
     (go-try- supervisor
-      ;; Remove from subscriptions map
-             (swap! subscriptions dissoc topic)
-
-             (let [peer @subscribe-peer-atom
-                   pubsub-state (or (:pubsub @peer) {})
-                   has-out? (contains? pubsub-state :out)]
-
-               (if has-out?
-          ;; Client peer: use standard unsubscribe
-                 (<? supervisor (pubsub/unsubscribe! peer #{topic}))
-
-          ;; Server peer: remove local subscription channel
-          ;; (Channel will be closed when consensus shuts down)
-                 nil))
-
-             true))
+             (let [peer @subscribe-peer-atom]
+               (if-let [ch (:local-channel handle)]
+                 (do
+                   (swap! peer update-in [:pubsub :topics topic :subscribers] disj ch)
+                   (close! ch))
+                 (when (= handle (get @subscriptions topic))
+                   (<? supervisor (pubsub/unsubscribe! peer #{topic}))))
+               (swap! subscriptions #(if (= handle (get % topic)) (dissoc % topic) %))
+               true)))
 
   (get-peer-count [this]
     (go-try- supervisor
@@ -167,40 +145,6 @@
 
   (close-network! [this]
     (go-try- supervisor
-      ;; NO unsubscribe. Stopping the peer is the disconnect, and announcing it
-      ;; first is politeness that can hang forever.
-      ;;
-      ;; `pubsub/unsubscribe!` ends in `(>? S out ...)` -- a PARKING put on the
-      ;; peer's outbound channel. `stop-network!` stops the server first, which
-      ;; closes every client's websocket, so by the time the clients tear down
-      ;; the consumer of that channel is gone. The put then parks forever, and
-      ;; whether a given client hangs depends on whether its out-channel buffer
-      ;; still had room -- which is exactly why roughly one run in six hung and
-      ;; the rest did not.
-      ;;
-      ;; Measured, with the steps traced: the server completed all five
-      ;; unsubscribes and stopped cleanly; three of four clients printed
-      ;; `unsubscribe :proposals` and never returned.
-      ;;
-      ;; The asymmetry that made this a trap has since been fixed upstream --
-      ;; `publish!` used `put?` with a callback so it could detect a closed
-      ;; subscriber and remove it, while `unsubscribe!` used `>?` and parked.
-      ;; kabel 0.3.107 (replikativ/kabel#21) brings unsubscribe into line, and
-      ;; the exact code below, restored verbatim, then completed 40 out of 40
-      ;; teardowns against it where it had hung on the first attempt before.
-      ;;
-      ;; We still do not send it. The fix means an unsubscribe to a dead peer
-      ;; no longer hangs; it does not make the message useful. Stopping the
-      ;; peer is the disconnect, and the server drops the subscriber when its
-      ;; next publish to that transport fails, so announcing it first buys
-      ;; nothing on a path where the peer we would be telling is already gone.
-      ;;
-      ;; Dropping the message costs nothing here. The server removes a
-      ;; subscriber when its transport put fails, so the disconnect
-      ;; deregisters us anyway; the unsubscribe was only ever an optimisation
-      ;; to deregister a little sooner. The `unsubscribe!` METHOD above still
-      ;; sends it, because that is a live operation on a live connection --
-      ;; the caller is staying connected and genuinely wants the server told.
              (when (not= @subscribe-peer-atom @peer-atom)
                (<? supervisor (peer/stop @subscribe-peer-atom)))
              (<? supervisor (peer/stop @peer-atom))

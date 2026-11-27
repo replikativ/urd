@@ -544,8 +544,13 @@
   before it reaches the voting rules, not asserted against."
   [st]
   (case (:kind st)
-    :nominate (let [n (+ (count (:votes st)) (count (:accepted st)))]
-                (and (pos? n) (<= n max-nomination-values)))
+    :nominate (let [{:keys [votes accepted]} st]
+                (and (or (set? votes) (sequential? votes))
+                     (or (set? accepted) (sequential? accepted))
+                     (or (seq votes) (seq accepted))
+                     (<= (count votes) max-nomination-values)
+                     (<= (count accepted) max-nomination-values)
+                     (<= (count (into (set votes) accepted)) max-nomination-values)))
     :prepare (let [{:keys [ballot prepared prepared-prime n-c n-h]} st
                    n-c (or n-c 0), n-h (or n-h 0)]
                (and (pos? (:counter ballot 0))
@@ -679,6 +684,8 @@
   {:nomination-timeout 4   ; ticks per nomination round, times the round number
    :ballot-timeout 4       ; ticks per ballot counter, times the counter
    :timeout-cap 8          ; stellar-core caps the linear growth; so do we
+   :qset-cache-limit 1000
+   :valid-fn some?
    :qset-reply-limit 64
    :qset-reply-bytes 1048576
    :gossip-interval 12})   ; re-broadcast, so a lost statement is not fatal
@@ -793,13 +800,27 @@
       (update st :nom-leaders into (map first (filter #(= top (second %)) prios)))
       st)))
 
+(defn- valid-value? [st value]
+  (and (some? value)
+       (boolean ((:valid-fn st) value))))
+
+(defn- add-nomination-vote [st v]
+  ;; Reserve space by distinct value: accepting an existing vote can always
+  ;; add it to :accepted without rendering the signed statement oversized.
+  (if (and (< (count (:nom-votes st)) max-nomination-values)
+           (valid-value? st v))
+    (update st :nom-votes conj v)
+    st))
+
 (defn- new-value-from-nomination
   "The highest-hashing value in a leader's statement that we have not voted for
   (`getNewValueFromNomination`). Hash-ordered rather than value-ordered so that
   no node can make its own value win by naming it cleverly."
   [st nom]
   (let [seen (:nom-votes st)
-        cands (remove seen (concat (:votes nom) (:accepted nom)))]
+        cands (when (< (count seen) max-nomination-values)
+                (filter #(and (not (contains? seen %)) (valid-value? st %))
+                        (concat (:votes nom) (:accepted nom))))]
     (when (seq cands)
       (->> cands
            (sort-by (fn [v] [(content-hash (canonical [(:slot st) (:prev-value st)
@@ -831,11 +852,11 @@
                  update-round-leaders)
           leaders (:nom-leaders st)
           st (if (contains? leaders (:id st))
-               (cond-> st (:value st) (update :nom-votes conj (:value st)))
+               (add-nomination-vote st (:value st))
                (reduce (fn [s l]
                          (if-let [nom (get (:nom-latest s) l)]
-                           (if-let [nv (new-value-from-nomination s nom)]
-                             (update s :nom-votes conj nv)
+                           (if-some [nv (new-value-from-nomination s nom)]
+                             (add-nomination-vote s nv)
                              s)
                            s))
                        st
@@ -856,14 +877,16 @@
                          (mapcat :votes)
                          distinct
                          (remove accepted)
+                         (filter #(valid-value? st %))
                          (filter (fn [v]
                                    (decided-true?
                                     (federated-accept st stmts
                                                       #(contains? (set (:votes %)) v)
                                                       #(contains? (set (:accepted %)) v)))))
                          (sort-by canonical))
-          st' (reduce (fn [s v] (-> s (update :nom-accepted conj v)
-                                    (update :nom-votes conj v)))
+          st' (reduce (fn [s v]
+                        (let [s (add-nomination-vote s v)]
+                          (cond-> s (contains? (:nom-votes s) v) (update :nom-accepted conj v))))
                       st to-accept)
           ;; (2) accept -> candidate
           to-cand (->> (:nom-accepted st')
@@ -879,9 +902,12 @@
                 st'
                 (reduce (fn [s l]
                           (if-let [nom (get (nomination-statements s) l)]
-                            (if-let [nv (new-value-from-nomination s nom)]
-                              (update s :nom-votes conj nv)
-                              s)
+                            (if (contains? (:followed-leaders s) l)
+                              s
+                              (if-some [nv (new-value-from-nomination s nom)]
+                                (-> s (add-nomination-vote nv)
+                                    (update :followed-leaders (fnil conj #{}) l))
+                                s))
                             s))
                         st'
                         (sort-by pr-str (:nom-leaders st'))))
@@ -890,7 +916,9 @@
         ;; A new candidate hands the composite value to the ballot protocol.
         (if (seq to-cand)
           (let [composite (combine-candidates st')]
-            (bump-state (assoc st' :composite composite) composite false))
+            (if (valid-value? st' composite)
+              (bump-state (assoc st' :composite composite) composite false)
+              st'))
           st')))))
 
 ;; ============================================================
@@ -1393,15 +1421,18 @@
                      (comp (remove #(contains? (:known-qsets st) (:qset-hash %)))
                            (map (juxt :qset-hash :from)))
                      stmts)
+        live (set (map :qset-hash stmts))
+        available (- (:qset-cache-limit st) (count (filter live (:fetched-qsets st))))
+        wanted (into {} (take available (sort-by (comp str key) wanted)))
         new (remove #(contains? (:requested st) (key %)) wanted)]
-    [(update st :requested into (map key) new)
+    [(assoc st :requested (set (keys wanted)))
      (mapv (fn [[h from]] (node/send-to from {:kind :get-qset :hash h}))
            (sort-by (comp str key) new))]))
 
 (defn- commit-effects
   "Externalizing commits, once."
   [st]
-  (if (and (:externalized st) (not (:committed? st)))
+  (if (and (= :externalize (:phase st)) (not (:committed? st)))
     [(assoc st :committed? true)
      [(node/commit [(:externalized st)])]]
     [st []]))
@@ -1447,7 +1478,11 @@
   (cond
     (not= from (:from stmt)) st
     (not= (:slot stmt) (:slot st)) st
+    (not (some #(contains? (qset-nodes %) from) (vals (:known-qsets st)))) st
     (not (statement-sane? stmt)) st
+    (and (not= :nominate (:kind stmt))
+         (not (every? #(valid-value? st (:value %))
+                      (keep stmt [:ballot :prepared :prepared-prime :commit])))) st
     (= :nominate (:kind stmt))
     (if (newer-nomination? (get-in st [:nom-latest (:from stmt)]) stmt)
       (assoc-in st [:nom-latest (:from stmt)] stmt)
@@ -1493,9 +1528,16 @@
             ;; Content-addressed and CHECKED. Skipping this check would let a
             ;; Byzantine peer answer a fetch with a quorum set of its choosing
             ;; and so manufacture a quorum for us out of nothing.
-            (-> st
-                (assoc-in [:known-qsets (:hash msg)] (:qset msg))
-                (update :requested disj (:hash msg)))
+            (let [h (:hash msg)
+                  order (:fetched-qsets st)
+                  full? (>= (count order) (:qset-cache-limit st))
+                  live (into #{} (map :qset-hash) (concat (vals (:ballot-latest st))
+                                                          (vals (:nom-latest st))))
+                  evict (when full? (first (remove live order)))]
+              (-> (cond-> st evict (update :known-qsets dissoc evict))
+                  (assoc :fetched-qsets (conj (if evict (vec (remove #{evict} order)) order) h))
+                  (assoc-in [:known-qsets h] (:qset msg))
+                  (update :requested disj h)))
             st)
     (record-statement st from msg)))
 
@@ -1534,7 +1576,7 @@
       (cond-> st (decided-true? r) (assoc :heard-from-quorum? true)))))
 
 (defn- transition [st input]
-  (let [st (assoc st :replies [])
+  (let [st (assoc st :replies [] :followed-leaders #{})
         st (case (:type input)
              ;; A message whose sender we did not VERIFY is dropped, as
              ;; Tendermint and Bullshark already drop theirs. `verified-by` is
@@ -1548,7 +1590,9 @@
              :timer-fired (let [st (handle-timer st (:timer-id input))]
                             (cond-> st (= :gossip (:timer-id input))
                                     (assoc :gossip? true :requested #{} :qset-served #{})))
-             :value-ready (-> st (assoc :value (:value input)) (nominate false))
+             :value-ready (if (and (not= :externalize (:phase st)) (valid-value? st (:value input)))
+                            (-> st (assoc :value (:value input)) (nominate false))
+                            st)
              :persisted (let [token (:token input)]
                           (cond-> st
                             (and (= (:epoch input) (:slot st)) token (= token (:nomination-token st)))
@@ -1558,7 +1602,7 @@
              st)
         replies (:replies st)
         st (-> st refresh-own settle update-heard-from-quorum)]
-    (finish (dissoc st :replies) replies)))
+    (finish (dissoc st :replies :followed-leaders) replies)))
 
 ;; ============================================================
 ;; The node
@@ -1570,13 +1614,24 @@
     (when-not (valid-qset? qset)
       (throw (ex-info "scp needs a valid :qset in config -- trust is per-node and subjective, a flat :validators list cannot express it"
                       {:peer-id (:peer-id cfg) :qset qset})))
+    (when-not (pos-int? (:qset-cache-limit cfg))
+      (throw (ex-info "SCP :qset-cache-limit must be positive" {})))
     (let [h (qset-hash qset)
-          restored (get-in cfg [:restored :durable :scp])]
+          restored (get-in cfg [:restored :durable :scp])
+          ballots (when restored (keep restored [:b :p :pp :c :h]))
+          values (concat (:nom-votes restored) (:nom-accepted restored) (:nom-candidates restored)
+                         (map :value ballots))]
+      (when (and restored (not (every? #(valid-value? cfg %) values)))
+        (throw (ex-info "The restored SCP statement fails the slot's application validity predicate"
+                        {:slot (:slot restored)})))
       (refresh-own
        (merge
         {:id (:peer-id cfg)
          :qset qset
          :qset-hash h
+         :fetched-qsets []
+         :qset-cache-limit (:qset-cache-limit cfg)
+         :valid-fn (:valid-fn cfg)
          :qset-served #{}
          :qset-response-size (alength (wire/signing-bytes {:kind :qset :hash h :qset qset}))
          :qset-reply-limit (:qset-reply-limit cfg)
@@ -1652,11 +1707,11 @@
           ;; and absent from the machine that had to act on it.
           restored-value (when (= :externalize (:phase st)) (:value (:c st)))
           st (cond-> st
-               restored-value (assoc :externalized restored-value :committed? true)
+               (some? restored-value) (assoc :externalized restored-value :committed? true)
                ;; A node with nothing to propose stays silent until the
                ;; application hands it a value; one configured with a value
                ;; starts nomination round 1 immediately.
-               (and (nil? restored-value) (:value st)) (nominate false))
+               (and (nil? restored-value) (valid-value? st (:value st))) (nominate false))
           st (assoc st :gossip-seq 1)]
       (finish (settle st)
               (cond-> [(node/log-effect :info (str "scp " (:id st) " slot " (:slot st)
@@ -1665,7 +1720,7 @@
                 ;; what its committed prefix is, not extending it. Emitting a
                 ;; `commit` would hand the application a second copy of a value
                 ;; it may already hold.
-                restored-value (conj (node/resync [restored-value]))))))
+                (some? restored-value) (conj (node/resync [restored-value]))))))
 
   (step [_ state input] (transition state input)))
 

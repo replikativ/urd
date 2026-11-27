@@ -63,6 +63,36 @@
 (defn- scoped-manifest [logical-key]
   [manifest-key logical-key])
 
+(defn- finish-cleanup!
+  "The active head and its garbage list switch in the same atomic write.
+  Deletion is idempotent, including a retry after the final deletion."
+  [ks scope manifest]
+  (go-try-
+   (when (seq (:garbage manifest))
+     (doseq [key (:garbage manifest)]
+       (<?- (k/dissoc ks key)))
+     (<?- (k/assoc-in ks [scope] (dissoc manifest :garbage))))
+   true))
+
+(defn- retired-keys
+  "Read the physical links before removing anything. The published deletion
+  list survives losing any intermediate link during cleanup."
+  [ks key]
+  (go-try-
+   (let [[kind _ first-id :as head] (<?- (k/get ks key))]
+     (when (and head (not= kind :append-log))
+       (throw (ex-info "Invalid retired consensus log head" {:log-key key})))
+     (loop [id first-id, garbage [key], seen #{}]
+       (if (nil? id)
+         garbage
+         (let [checkpoint-node? (and (vector? id) (= [::checkpoint-record key] (vec (butlast id))))
+               metadata (<?- (k/get-meta ks id))]
+           (when-not (and (not (contains? seen id))
+                          (or (and checkpoint-node? (= id (:key metadata)))
+                              (and (= key (:key metadata)) (= :append-log (:type metadata)))))
+             (throw (ex-info "Invalid consensus append-log ownership" {:log-key key :record id})))
+           (recur (<?- (k/get-in ks [id :next])) (conj garbage id) (conj seen id))))))))
+
 (defn- resolve-key!
   "Resolve a logical log once, in the same queue that orders its operations."
   [ks key-atom logical-key]
@@ -86,21 +116,34 @@
                           "the legacy and requested logs. Copy the verified history into "
                           "a private log, then set the scoped manifest to {:log-key private-log-key}.")
                      {:requested-log logical-key :legacy-log legacy-key :manifest scoped})))]
+       (<?- (finish-cleanup! ks scoped current))
        (reset! key-atom physical-key))
      @key-atom)))
 
 (defn- replace-log! [ks key-atom logical-key old-key records]
   (go-try-
-   (let [new-key (keyword (namespace ::manifest) (str "write-log-" (random-uuid)))
-         ;; A legacy manifest may be the only way to recover an unidentified
-         ;; custom log. Preserve that source across the first scoped checkpoint.
-         legacy-key (:log-key (<?- (k/get-in ks [manifest-key])))]
-     (doseq [record records]
-       (<?- (k/append ks new-key record)))
-     (<?- (k/assoc-in ks [(scoped-manifest logical-key)] {:log-key new-key}))
+   (let [scope (scoped-manifest logical-key)
+         new-key (keyword (namespace ::manifest) (str "write-log-" (random-uuid)))
+         records (vec records)
+         ids (mapv (fn [i] [::checkpoint-record new-key i]) (range (count records)))
+         legacy-key (:log-key (<?- (k/get-in ks [manifest-key])))
+         garbage (when (not= old-key legacy-key) (<?- (retired-keys ks old-key)))
+         committed (cond-> {:log-key new-key} (seq garbage) (assoc :garbage garbage))]
+     ;; Re-resolve after any error, including one reported after a manifest
+     ;; write became durable. An in-process retry must observe the same state
+     ;; as a newly opened writer.
+     (reset! key-atom ::unresolved)
+     (<?- (k/assoc-in ks [scope] {:log-key old-key :garbage (conj ids new-key)}))
+     ;; Use Konserve's append-log representation so regular append/reduce-log
+     ;; and existing readers work. Predeclared IDs make an interrupted build
+     ;; reclaimable even when its first entry never reached a head pointer.
+     (doseq [[i record] (map-indexed vector records)]
+       (<?- (k/assoc-in ks [(ids i)] {:elem record :next (get ids (inc i))})))
+     (when (seq ids)
+       (<?- (k/assoc-in ks [new-key] [:append-log (peek ids) (first ids)])))
+     (<?- (k/assoc-in ks [scope] committed))
+     (<?- (finish-cleanup! ks scope committed))
      (reset! key-atom new-key)
-     (when (not= old-key legacy-key)
-       (<?- (k/dissoc ks old-key)))
      true)))
 
 (defn- run-writer [ks log-key fallback queue]
@@ -124,6 +167,10 @@
     reply))
 
 (defrecord KonserveStore [ks log-key logical-key queue writer]
+  store/ReplayStore
+  (update-replay! [_ key f]
+    (submit! queue (fn [_] (k/update-in ks [[::replay logical-key key]] f))))
+
   store/DurableStore
 
   (write! [_ record]
@@ -150,6 +197,8 @@
   an application, and closing something you were lent is not yours to do."
   ([ks] (konserve-store ks {}))
   ([ks {:keys [log-key] :or {log-key default-log-key}}]
+   (when (false? (get-in ks [:config :sync-blob?]))
+     (throw (ex-info "Consensus filestore requires :sync-blob? true" {})))
    (let [queue (chan 64)
          key-atom (atom ::unresolved)
          writer (run-writer ks key-atom log-key queue)]

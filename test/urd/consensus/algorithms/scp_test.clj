@@ -1182,3 +1182,45 @@
     (is (some? (scp/externalized (sim/node-state s :a))))
     (is (pos? (writes s)))
     (is (= (writes s) (writes later)))))
+
+(deftest external-validity-applies-to-nominations-prepared-and-composite-values
+  (let [impl (scp/make)
+        q {:threshold 1 :validators [:b]}
+        h (scp/qset-hash q)
+        st (:state (node/init impl {:peer-id :a :qset q :value :approved
+                                    :valid-fn #{:approved}
+                                    :combine-fn (constantly :unapproved)}))
+        deliver (fn [s m] (:state (node/step impl s (node/message-received :b
+                                                                           (merge {:from :b :slot 0 :qset-hash h} m)
+                                                                           #{:b}))))
+        nomination (fn [v] {:kind :nominate :votes #{v} :accepted #{v}})
+        bad-nom (deliver st (nomination :unapproved))
+        good-nom (deliver st (nomination :approved))]
+    (is (not (contains? (:nom-votes bad-nom) :unapproved)))
+    (is (empty? (:nom-accepted bad-nom)))
+    (is (contains? (:nom-candidates good-nom) :approved))
+    (is (nil? (:b good-nom)))
+    (doseq [msg [{:kind :prepare :ballot (scp/ballot 1 :approved)
+                  :prepared (scp/ballot 1 :unapproved)}
+                 {:kind :confirm :ballot (scp/ballot 1 :unapproved) :n-h 1 :n-commit 1}
+                 {:kind :externalize :commit (scp/ballot 1 :unapproved) :n-h 1}]]
+      (is (empty? (:ballot-latest (deliver st msg)))))))
+
+(deftest quorum-set-cache-bounds-fetched-entries-and-pins-configured-sets
+  (let [impl (scp/make)
+        st (:state (node/init impl {:peer-id :a :qset flat-qset :qset-cache-limit 1}))
+        fetch (fn [s q]
+                (let [h (scp/qset-hash q)]
+                  (:state (node/step impl (assoc s :requested #{h})
+                                     (node/message-received :b {:kind :qset :hash h :qset q} #{:b})))))
+        q1 {:threshold 1 :validators [:c]}
+        q2 {:threshold 1 :validators [:d]}
+        s (-> st (fetch q1) (fetch q2))]
+    (is (= #{(scp/qset-hash flat-qset) (scp/qset-hash q2)} (set (keys (:known-qsets s)))))))
+
+(deftest local-nomination-growth-preserves-the-wire-limit
+  (let [values (set (range scp/max-nomination-values))
+        st {:valid-fn some? :nom-votes values :nom-accepted values}
+        full (#'scp/add-nomination-vote st :next)]
+    (is (= values (:nom-votes full)))
+    (is (scp/statement-sane? (#'scp/own-nomination-statement full)))))

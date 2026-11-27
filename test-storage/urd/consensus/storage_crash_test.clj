@@ -29,6 +29,7 @@
   Run with clojure -M:storage-sim, including in the release workflow."
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.core.async :refer [<!!]]
+            [konserve.core :as k]
             [konserve.simulation.crash :as crash]
             [konserve.impl.defaults :as defaults]
             [konserve.impl.storage-layout :as sl]
@@ -280,3 +281,52 @@
                          got)
               (str point ": one log or the other, never neither -- got "
                    (pr-str got))))))))
+
+
+(deftest repeated-checkpoints-reclaim-physical-log-entries
+  (let [{:keys [backing state-atom]} (fresh)
+        st (urd-store-on backing)
+        record (fn [n] {:writes {:n n} :durable? true})
+        compact (fn [n]
+                  (doseq [i (range n (+ n 8))]
+                    (is (true? (<!! (store/write! st (record i))))))
+                  (is (true? (<!! (store/checkpoint! st [(record n)]))))
+                  (count (crash/get-synced-data state-atom)))]
+    (is (= (compact 0) (compact 10) (compact 20)))
+    (is (= [{:n 20}] (writes-in (<!! (store/restore st)))))
+    (<!! (store/close-store! st))))
+
+(deftest cleanup-resumes-on-either-side-of-checkpoint-publication
+  (doseq [phase [:building :retiring]]
+    (let [{:keys [backing state-atom]} (fresh)
+          st (urd-store-on backing)
+          old (mapv (fn [n] {:writes {:n n}}) (range 4))
+          new (mapv (fn [n] {:writes {:n n}}) (range 10 13))
+          original-assoc k/assoc-in
+          original-dissoc k/dissoc
+          deletions (atom 0)]
+      (doseq [r old] (is (true? (<!! (store/write! st r)))))
+      (let [before (count (crash/get-synced-data state-atom))
+            result (with-redefs [k/assoc-in
+                                 (fn [ks path v & opts]
+                                   (if (and (= phase :building) (= {:n 11} (get-in v [:elem :writes])))
+                                     (throw (ex-info "interrupted build" {}))
+                                     (apply original-assoc ks path v opts)))
+                                 k/dissoc
+                                 (fn [ks key & opts]
+                                   (if (and (empty? opts) (= phase :retiring) (= 2 (swap! deletions inc)))
+                                     (throw (ex-info "interrupted cleanup" {}))
+                                     (apply original-dissoc ks key opts)))]
+                     (<!! (store/checkpoint! st new)))]
+        (is (= (if (= phase :building) "interrupted build" "interrupted cleanup") (ex-message result)))
+        (<!! (store/close-store! st))
+        (crash/simulate-crash! state-atom)
+        (let [reopened (urd-store-on backing)
+              expected (if (= phase :building) old new)]
+          (is (= expected (:writes (<!! (store/restore reopened)))))
+          ;; An interrupted first checkpoint can introduce one scoped manifest.
+          ;; All partial or retired payload blobs must have been removed.
+          (is (<= (count (crash/get-synced-data state-atom)) (inc before)))
+          (is (true? (<!! (store/checkpoint! reopened new))))
+          (is (= new (:writes (<!! (store/restore reopened)))))
+          (<!! (store/close-store! reopened)))))))

@@ -89,10 +89,18 @@
                         :votes (:votes event)}}
     event))
 
+(defn landed-step
+  "Drive one normal input with an immediately durable test store."
+  [impl state input]
+  (let [{:keys [state effects] :as result} (n/step impl state input)]
+    (if-let [[_ {:keys [token epoch]}] (some #(when (= :persist-then (first %)) %) effects)]
+      (n/step impl state (n/persisted token epoch))
+      result)))
+
 (defn handle-event
   "`handle-event`, in the new protocol's terms."
   [impl state event]
-  (n/step impl state (->input event)))
+  (landed-step impl state (->input event)))
 
 (defn initial-state
   "`initial-state`, in the new protocol's terms.
@@ -480,9 +488,9 @@
     (let [impl (rr/create {:a nil :b nil :c nil})
           st (:state (n/init impl (merge (rr/test-attestations) {:peer-id :a :validators [:a :b :c]})))
           ;; A finalization for exactly one height ahead of us.
-          r (n/step impl st {:type :message-received :from :b
-                             :msg {:kind :finalized :height 1
-                                   :proposal {:snapshot-id :p1}}})
+          r (landed-step impl st {:type :message-received :from :b
+                                  :msg {:kind :finalized :height 1
+                                        :proposal {:snapshot-id :p1}}})
           recovery (->> (:effects r)
                         (filter #(= :broadcast (n/effect-kind %)))
                         (map n/effect-params)
@@ -503,12 +511,12 @@
             loss."
     (let [impl (rr/create {:a nil :b nil :c nil})
           st (:state (n/init impl (merge (rr/test-attestations) {:peer-id :a :validators [:a :b :c]})))
-          r (n/step impl st {:type :message-received :from :b
-                             :msg {:kind :state-sync-response
-                                   :current-height 3
-                                   :finalized {0 {:snapshot-id :p0}
-                                               1 {:snapshot-id :p1}
-                                               2 {:snapshot-id :p2}}}})
+          r (landed-step impl st {:type :message-received :from :b
+                                  :msg {:kind :state-sync-response
+                                        :current-height 3
+                                        :finalized {0 {:snapshot-id :p0}
+                                                    1 {:snapshot-id :p1}
+                                                    2 {:snapshot-id :p2}}}})
           committed (->> (:effects r)
                          (filter #(= :commit (n/effect-kind %)))
                          (mapcat #(:vertices (n/effect-params %))))]
@@ -519,13 +527,13 @@
     ;; A peer's history with a GAP must not produce a gapped commit sequence.
     (let [impl (rr/create {:a nil :b nil :c nil})
           st (:state (n/init impl (merge (rr/test-attestations) {:peer-id :a :validators [:a :b :c]})))
-          r (n/step impl st {:type :message-received :from :b
-                             :msg {:kind :state-sync-response
-                                   :current-height 5
-                                   :finalized {0 {:snapshot-id :p0}
-                                               1 {:snapshot-id :p1}
+          r (landed-step impl st {:type :message-received :from :b
+                                  :msg {:kind :state-sync-response
+                                        :current-height 5
+                                        :finalized {0 {:snapshot-id :p0}
+                                                    1 {:snapshot-id :p1}
                                                ;; 2 missing
-                                               3 {:snapshot-id :p3}}}})
+                                                    3 {:snapshot-id :p3}}}})
           committed (->> (:effects r)
                          (filter #(= :commit (n/effect-kind %)))
                          (mapcat #(:vertices (n/effect-params %))))]
@@ -1187,11 +1195,11 @@
 (deftest a-single-proposer-can-commit-without-loopback
   (let [sm (rr/create {validator-a nil})
         st (initial-state sm {:peer-id validator-a})
-        result (n/step sm st (n/value-ready test-proposal {:height 0}))]
+        result (landed-step sm st (n/value-ready test-proposal {:height 0}))]
     (is (contains-effect? (:effects result) :commit))
     (is (= 1 (:height (:state result))))
     (is (= (:state result)
-           (:state (n/step sm (:state result) (n/value-ready test-proposal {:height 0})))))))
+           (:state (landed-step sm (:state result) (n/value-ready test-proposal {:height 0})))))))
 
 (deftest synchronized-history-uses-the-same-membership-and-validity-rules
   (let [sm (rr/create test-validators)
@@ -1203,3 +1211,84 @@
     (is (= 1 (:height synced)))
     (is (contains? (:validator-set synced) new-member))
     (is (= (:validator-set direct) (:validator-set synced)))))
+
+(deftest empty-explicit-rosters-fail-at-initialization
+  (is (thrown? Exception (n/init (rr/create {}) (merge test-atts {:peer-id :a})))))
+
+(deftest a-new-roster-can-relay-a-decision-made-by-the-old-roster
+  (let [node (rr/create {:a nil})
+        init #(initial-state node {:peer-id %})
+        handover {:snapshot-id :handover
+                  :validator-updates [{:id :a :power 0} {:id :b :power 1}]}
+        next-value {:snapshot-id :next}
+        send-msg (fn [state from msg]
+                   (landed-step node state (n/message-received from msg #{from})))
+        own (landed-step node (init :a) (n/value-ready handover {:height 0}))
+        announcement (:msg (some #(when (= :finalizations (:topic (n/effect-params %)))
+                                    (n/effect-params %)) (:effects own)))
+        entered (:state (send-msg (init :b) :a announcement))
+        advanced (:state (landed-step node entered (n/value-ready next-value {:height 1})))
+        answer (:msg (n/effect-params (first (:effects (rr/answer-state-sync advanced :lagging 0)))))
+        lagging (init :lagging)
+        restored (send-msg lagging :b answer)]
+    (is (= 2 (:height (:state restored))))
+    (is (= {0 handover 1 next-value} (:finalized (:state restored))))
+    (is (= {:b nil} (:validator-set (:state restored))))
+    (is (zero? (:height (:state (send-msg lagging :b (dissoc answer :proofs))))))
+    (is (zero? (:height (:state (send-msg lagging :b
+                                          (assoc-in answer [:finalized 0 :validator-updates] []))))))))
+
+(defn- restore-writes [effects]
+  (let [writes (mapv #(select-keys (second %) [:writes :durable?]) effects)]
+    {:writes writes :durable (reduce merge {} (map :writes writes))}))
+
+(deftest proposal-and-recovery-replies-wait-for-the-same-durable-vote
+  (let [node (rr/create)
+        cfg (merge test-atts {:peer-id :a :validators [:a :b :c]})
+        start (:state (n/init node cfg))
+        chosen {:snapshot-id :first}
+        proposal (n/step node start (n/value-ready chosen {:height 0}))
+        recovery (n/step node (:state proposal)
+                         (n/message-received :b {:kind :want-votes :proposal-id :first} #{:b}))
+        released (n/step node (:state recovery) (n/persisted 1 0))
+        restarted (n/init node (assoc cfg :restored (restore-writes (:effects proposal))))
+        replace (n/step node (:state restarted)
+                        (n/value-ready {:snapshot-id :second} {:height 0}))]
+    (is (= [:persist-then] (mapv first (:effects proposal))))
+    (is (true? (get-in proposal [:effects 0 1 :durable?])))
+    (is (empty? (:effects recovery)))
+    (is (empty? (:effects (n/step node (:state recovery) (n/persisted 1 1)))))
+    (is (= [:broadcast :set-timer :send] (mapv first (:effects released))))
+    (is (= chosen (:current-proposal (:state restarted))))
+    (is (= (:votes (:state proposal)) (:votes (:state restarted))))
+    (is (= [chosen] (keep #(get-in % [1 :msg :proposal]) (:effects replace))))))
+
+(deftest durable-completion-orders-decisions-and-recovers-the-app-cursor
+  (let [node (rr/create)
+        cfg (merge test-atts {:peer-id :a :validators [:a :b :c]})
+        start (:state (n/init node cfg))
+        chosen {:snapshot-id :first :validator-updates [{:id :d :power 1}]}
+        proposal (n/step node start (n/value-ready chosen {:height 0}))
+        decision (n/step node (:state proposal)
+                         (n/message-received :b {:kind :vote :proposal-id :first :voter :b
+                                                 :att (attest :b :first)} #{:b}))
+        landed-second (n/step node (:state decision) (n/persisted 2 0))
+        landed-first (n/step node (:state landed-second) (n/persisted 1 0))
+        wal (restore-writes (into (:effects proposal) (:effects decision)))
+        open #(n/init node (assoc cfg :restored wal :delivered-through %))
+        recovered (open 0)]
+    (is (= [:persist-then] (mapv first (:effects decision))))
+    (is (empty? (:effects landed-second)))
+    (is (= [chosen] (mapcat #(get-in % [1 :vertices]) (:effects landed-first))))
+    (is (= 1 (:height (:state recovered))))
+    (is (contains? (:validator-set (:state recovered)) :d))
+    (is (= (:finalization-proofs (:state decision)) (:finalization-proofs (:state recovered))))
+    (is (= (n/commit [chosen]) (first (:effects recovered))))
+    (is (= (n/resync [chosen]) (first (:effects (open nil)))))
+    (is (= [:set-timer] (mapv first (:effects (open 1)))))
+    (is (thrown? Exception (open 2)))
+    (is (thrown? Exception (n/init node (assoc cfg :restored (update wal :writes subvec 1)))))
+    (is (thrown? Exception (n/init node (assoc cfg :peer-id :b :restored wal))))
+    (is (thrown? Exception (n/init node (assoc cfg :delivered-through 1))))
+    (is (thrown? Exception (n/init node (assoc cfg :require-round-robin-history? true))))
+    (is (thrown? Exception (n/init node (assoc cfg :restored {:writes [{:writes {:old true}}]}))))))

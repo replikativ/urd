@@ -386,6 +386,39 @@
     (is (bs/well-formed? st c))
     (is (false? (bs/well-formed? st (update c :votes vec))))))
 
+(deftest ingress-requires-canonical-parents
+  (let [st (node-init {})
+        header {:author :b :round 1 :payload nil :parents (ids-at st 0 vs)}
+        c (cert* header vs)
+        alternate (update header :parents vec)]
+    (is (= (bs/header-id header) (bs/header-id alternate)))
+    (is (false? (bs/well-formed? st (assoc c :header alternate))))
+    (let [response (n/step (bs/create) st
+                           (n/message-received :b {:kind :header :header alternate} #{:b}))]
+      (is (= 1 (get-in response [:state :rejected :malformed])))
+      (is (empty? (:effects response))))))
+
+(deftest stake-and-retention-configuration
+  (is (= 8 (bs/store-depth (node-init {:gc-depth 2 :store-depth 8}))))
+  (is (thrown? Exception (node-init {:gc-depth 2 :store-depth 2})))
+  (doseq [bad [(dissoc uniform :b) (assoc uniform :e 1)
+               (assoc uniform :b 0) (assoc uniform :b 1.5)
+               (assoc uniform :a 4294967295)]]
+    (is (thrown? Exception (node-init {:stake bad}))))
+  (is (= 4294967295 (:total-stake (node-init {:stake (assoc uniform :a 4294967292)})))))
+
+(deftest legacy-archives-require-the-original-schedule-when-uuid-order-changes
+  (let [lo #uuid "01000000-0000-0000-0000-000000000000"
+        hi #uuid "81000000-0000-0000-0000-000000000000"
+        cfg {:peer-id lo :validators [lo hi]}
+        st (node-init cfg)
+        c (cert* {:author hi :round 1 :payload nil :parents (ids-at st 0 [lo hi])} [lo hi])
+        current (:writes (n/effect-params (first (:effects (insert st c)))))
+        recover (fn [writes] (node-init (assoc cfg :restored {:writes [{:writes writes}]})))]
+    (is (some? (get-in (recover current) [:dag 1 hi])))
+    (is (thrown-with-msg? Exception #"historical :anchor-fn"
+                          (recover (dissoc current [::bs/ordering-version]))))))
+
 (deftest late-certificates-stay-below-the-authors-committed-watermark
   (let [st (-> (node-init {}) (assoc :last-committed-round 2)
                (assoc-in [:last-committed :b] 2))
@@ -650,6 +683,55 @@
           "the isolated node re-joins and orders the whole history it missed")
       (is (= (:round (sim/node-state healed :d)) (:round (sim/node-state healed :a)))))))
 
+(deftest a-validator-catches-up-beyond-every-peers-retention-window
+  (let [cfg (merge atts {:gc-depth 3 :store-depth 5 :archive-catchup? true
+                         :anchor-fn (fn [_ _ _] :a)})
+        isolated (-> (sim/make {:seed 17 :nodes (zipmap vs (repeat (bs/create)))
+                                :node-config (zipmap vs (repeat cfg))
+                                :config {:value-fn value-fn}})
+                     (sim/run 20)
+                     (sim/partition-network [#{:a :b :c} #{:d}])
+                     (sim/run 100))
+        behind (:round (sim/node-state isolated :d))
+        target (count (sim/committed isolated :a))
+        healed (sim/run (sim/heal isolated) 180)]
+    (doseq [peer [:a :b :c]]
+      (let [earliest (apply min (map #(get-in % [:header :round])
+                                     (vals (:certificates (sim/node-state isolated peer)))))]
+        (is (< behind earliest))))
+    (is (pos? target))
+    (is (>= (count (sim/committed healed :d)) target))
+    (is (sim/agreement? healed))
+    (is (some #(pos? (get (sim/node-state healed %) :archive-seq 0)) [:a :b :c]))))
+
+(deftest archived-reads-are-opt-in-bounded-and-fair-across-validators
+  (let [certs (mapv #(get (bs/genesis-certificates vs) %) vs)
+        ids (mapv :id certs)
+        base (assoc (node-init {:gc-depth 1 :store-depth 2})
+                    :last-committed-round 8 :certificates {})
+        want (fn [s peer r]
+               (:state (n/step (bs/create) s
+                               (n/message-received peer {:kind :want :round r
+                                                         :digests (vec (take 100 (cycle ids)))} #{peer}))))
+        tick #(n/step (bs/create) % (n/timer-fired :gossip))
+        enabled (assoc base :archive-catchup? true)
+        queued (-> enabled (want :b 2) (want :c 3) (want :b 1) (want :outside 1))
+        active (tick queued)
+        next-state (-> (:state active) (want :b 1) tick :state)
+        token (get-in next-state [:archive-active :token])
+        complete (n/step (bs/create) next-state
+                         (n/durable-values token {[:cert (first ids)]
+                                                  {:id (first ids) :header {:round 1}}}))]
+    (is (empty? (:archive-queue (want base :b 1))))
+    (is (empty? (:archive-queue (want enabled :b 7))))
+    (is (= [:b :c] (:archive-queue queued)))
+    (is (= [(n/read-durable token (map #(vector :cert %) ids))]
+           (filter #(= :read-durable (first %)) (:effects active))))
+    (is (= 1 (:archive-seq next-state)))
+    (is (= :b (get-in complete [:effects 0 1 :to])))
+    (is (= :c (get-in (tick (:state complete)) [:state :archive-active :peer])))
+    (is (empty? (:certificates (:state complete))))))
+
 (deftest a-rejoining-node-resumes-PROPOSING-not-just-following
   (testing "ordering the history you missed is not the same as coming back
 
@@ -783,8 +865,8 @@
           kinds (frequencies (map ffirst (mapcat :writes writes)))]
       (is (pos? (:cert kinds)))
       (is (pos? (:voted kinds)))
-      (is (= #{:cert :voted :proposed} (set (keys kinds)))
-          "three things are durable, and no event log among them: the
+      (is (= #{:cert :voted :proposed ::bs/ordering-version} (set (keys kinds)))
+          "the archive records its ordering version; the durable values are the
            certificate archive, the double-sign guard, and this node's own
            proposals so it can re-send rather than re-sign them"))))
 

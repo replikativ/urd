@@ -64,6 +64,13 @@ pass straight through to `init`.
 would run the node's continuation on the writer's stack, out of order with
 everything else. A durable-write failure is fatal, and used to be silent.
 
+**`read-durable`** asks for the latest landed values of explicit storage keys.
+The runtime streams the retained log once, accumulating matching keys, then
+delivers a local `:durable-values` input carrying the caller’s token. The
+simulator reads its merged view of landed records. A missing key is omitted.
+A failed read logs a warning and returns an empty result so optional
+historical catch-up can retry.
+
 **`set-timer`** is where the subtlest bug lived. Registration must be
 synchronous, removal conditional *by identity*, and a replacement must be
 registered before the old one is cancelled — otherwise a timer fires after
@@ -92,6 +99,11 @@ it happens here, in a go block, and never inside `step`.
 
 An unsubscribed topic never delivers, silently, which is why capability
 declarations are enforced rather than advisory.
+
+Await `stop-runtime!` before reusing a node’s store or network. Shutdown waits
+for the event loop, in-flight message authentication, and transport broadcasts.
+A pending backend operation must complete for shutdown to finish. If removing
+a subscription fails, a second stop retries the remaining handles.
 
 ## Faults are not all equal
 
@@ -122,6 +134,13 @@ the application data. If the application is behind the retained history,
 restore an application snapshot before restarting the validator. For an older
 compacted Raft log with no voter metadata, supply `:restored-membership` with
 the authoritative `:index`, `:validators` and `:outgoing` at that index.
+
+Konserve checkpoints retire the previous generation’s reachable records. The
+scoped manifest records each pending deletion before the first affected write,
+so an interrupted build or cleanup resumes on the next operation or reopen.
+A checkpoint temporarily holds one physical key per retired record in memory
+and in its recovery manifest. Orphans from versions that already discarded the
+old head require a separate offline migration with verified ownership.
 
 An older Konserve checkpoint recorded its physical log key without recording
 which logical log owned it. The default log remains readable. If a custom

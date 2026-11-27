@@ -15,7 +15,8 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [urd.consensus.attest :as attest]
             [urd.consensus.node :as n]
-            [urd.consensus.algorithms.round-robin :as rr]))
+            [urd.consensus.algorithms.round-robin :as rr]
+            [urd.consensus.algorithms.round-robin-test :refer [landed-step]]))
 
 ;; ============================================================
 ;; Generators
@@ -268,7 +269,7 @@
   "Deliver an event to a specific validator and return new state."
   [validator-state event]
   (let [{:keys [sm state]} validator-state
-        result (n/step sm state (->input event))]
+        result (landed-step sm state (->input event))]
     {:sm sm
      :state (:state result)
      :effects (:effects result)}))
