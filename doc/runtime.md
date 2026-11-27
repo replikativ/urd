@@ -112,6 +112,23 @@ produced and cannot interpret is a real fault. `rt/last-error` and
 - `urd.consensus.stores.konserve/konserve-store` — any konserve backend
   (file, LMDB, S3, JDBC, IndexedDB); `connect-fs-store!` is a JVM convenience
 
+Use one writer per logical consensus log. The Konserve backend serializes
+appends, reads and checkpoints on that writer. A durable operation must yield
+`true` before the runtime releases its dependent effects.
+
+For Raft and Tendermint recovery, supply `:delivered-through` from the
+application's own durable state. Update that cursor in the same transaction as
+the application data. If the application is behind the retained history,
+restore an application snapshot before restarting the validator. For an older
+compacted Raft log with no voter metadata, supply `:restored-membership` with
+the authoritative `:index`, `:validators` and `:outgoing` at that index.
+
+An older Konserve checkpoint recorded its physical log key without recording
+which logical log owned it. The default log remains readable. If a custom
+`:log-key` encounters that ambiguous pointer, startup reports the keys needed
+to identify and migrate the correct history. Stop writers and preserve a copy
+of the backend before resolving ownership.
+
 ## Networks
 
 `urd.consensus.network/ConsensusNetwork` is `broadcast!` and `subscribe!`.

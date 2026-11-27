@@ -4,9 +4,7 @@ version: 2.1
 # (real sockets), `:cljs-test` (built to a file, then run under node), and
 # `:format`.
 #
-# NOT here: `:storage-sim`, which needs a `../konserve` checkout because
-# `konserve.simulation.*` is unreleased. `bin/test-all` runs it and says so
-# loudly when it cannot.
+# Storage fault injection runs against the Konserve version in :storage-sim.
 #
 # The ledger suites used to be excluded here for the same reason. They are now
 # in ../skuld, where they are that project's own gate rather than an
@@ -36,6 +34,9 @@ workflows:
           context: docker-deploy
           requires:
             - tools/setup
+      - test-storage:
+          requires:
+            - tools/setup
       - test-proofs:
           context: docker-deploy
           requires:
@@ -53,6 +54,9 @@ workflows:
               only: main
           requires:
             - tools/build
+            - tools/format
+            - test-proofs
+            - test-storage
             - test-consensus
             - test-integration
             - test-cljs
@@ -104,6 +108,14 @@ jobs:
       - run:
           name: Check the proofs and the shipped copies
           command: clojure -M:proofs
+
+  test-storage:
+    docker:
+      - image: cimg/clojure:1.12
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - run: clojure -M:storage-sim
 
   # The real-network tests: four validators over actual websockets. Separate
   # from `test-consensus` because they are slower and because they compete for

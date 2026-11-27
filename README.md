@@ -26,22 +26,25 @@ Portable Clojure and ClojureScript. Part of the
 
 ## Status
 
-**Pre-1.0. The API will move.** What is here is tested hard — 650 tests on the
-JVM, 48 under Node, 15 over real sockets — but the seams have changed twice in
-recent weeks and will change again before 1.0.
+Urd is experimental. The JVM, Node and real-network suites exercise the
+implementations, and the proof suite checks the signing order and quorum
+arithmetic. Each algorithm has its own deployment assumptions.
 
-Honest maturity, per component:
-
-- **Tendermint** is the strongest deployment candidate: Byzantine, absolutely
-  final, durable, with validator set changes and a dedicated adversarial suite.
-- **Raft** is a deployment candidate for crash faults, including joint
-  consensus, ported from `etcd-io/raft`.
-- **Round-robin** keeps no durable state and says so — it is a *reference*, not
-  a deployment candidate.
-- **Nakamoto** is in the portfolio as a generality test for the protocol, not
-  as a product.
-- **Snowman**, **SCP** and **Bullshark** are reference-grade: faithful to their
-  papers, without the production extras (BLS aggregation, catch-up, snapshots).
+- **Raft** is the first beta target for crash faults. It supports joint
+  membership and local checkpoints. A follower or application behind the
+  retained log needs an external snapshot. A legacy compacted store requires
+  the authoritative voter configuration for recovery.
+- **Tendermint** supports weighted Byzantine voting, durable locks and
+  certificate-based catch-up. Applications using map proposals with an
+  explicit `:id` must verify that the ID binds the entire payload, including
+  any validator updates. Build a proposal with
+  `(assoc payload :id (tm/content-id payload))` and configure every validator
+  with `:valid-fn (every-pred tm/valid-content-id? application-valid?)`,
+  where `tm` names `urd.consensus.algorithms.tendermint`.
+- **Round-robin** is a crash-fault reference with volatile votes.
+- **Nakamoto** implements header-chain selection and exposes reversible commits.
+- **Snowman**, **SCP** and **Bullshark** are reference implementations for
+  protocol experiments and simulation.
 
 Cryptography is real. `urd.consensus.auth` is Ed25519 over canonical CBOR and
 the runtime verifies every inbound message; `:auth` is a required argument, and
@@ -149,11 +152,11 @@ API documentation is on [cljdoc](https://cljdoc.org/d/org.replikativ/urd).
 ## Testing
 
 ```bash
-clj -M:test                              # 650 tests; excludes ^:integration
+clj -M:test                              # JVM unit and property tests
 clj -M:integration                       # real sockets, real handshakes
-clj -M:cljs-test && node target/cljs-test.js   # 48 tests under Node
+clj -M:cljs-test && node target/cljs-test.js   # portable tests under Node
 clj -M:storage-sim                       # konserve's crash simulator
-clj -M:proofs                            # machine-checked theorems (optional)
+clj -M:proofs                            # theorems and implementation correspondence
 bin/test-all                             # all of the above, sequentially
 ```
 
