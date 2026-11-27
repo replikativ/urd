@@ -12,7 +12,6 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [superv.async :refer [S <?? <?- go-try-]]
-            [konserve.memory :refer [new-mem-store]]
             [urd.consensus.runtime :as runtime]
             [urd.consensus.node :as node]
             [urd.consensus.network :as net]
@@ -116,9 +115,6 @@
          _ (when-not validator-set
              (throw (ex-info "config missing :validator-set"
                              {:provided (sort (keys config))})))
-
-          ;; Create storage
-         store (<?- (new-mem-store))
 
           ;; Create state machine
                  ;; A `urd.consensus.node/Node`. This used to be a

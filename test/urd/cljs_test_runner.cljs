@@ -13,6 +13,7 @@
             [urd.consensus.portability-test]
             [urd.consensus.sim-portability-test]
             [urd.consensus.substrate-portability-test]
+            [urd.konserve-checkpoint-test]
             [urd.auth-probe]
             [urd.wire-test]))
 
@@ -42,6 +43,7 @@
                ;; runtime. The job that exists to make the portability claim
                ;; falsifiable was not touching the half that was false.
                'urd.consensus.substrate-portability-test
+               'urd.konserve-checkpoint-test
                'urd.auth-probe
                ;; The signing bytes, pinned to a literal produced by Python.
                ;; This is the ONE test whose value comes entirely from running

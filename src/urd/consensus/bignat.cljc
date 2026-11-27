@@ -43,7 +43,6 @@
 
 (def limb-bits 16)
 (def limb-base 65536)
-(def ^:private limb-mask 65535)
 
 (def zero [])
 (def one [1])

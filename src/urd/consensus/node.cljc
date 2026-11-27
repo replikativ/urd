@@ -149,8 +149,8 @@
 
 (defn value-ready
   "Response to a `request-value` effect: the application supplied a payload."
-  [value]
-  {:type :value-ready :value value})
+  ([value] {:type :value-ready :value value})
+  ([value context] (assoc (value-ready value) :context context)))
 
 (defn vertex-received
   "A vertex (block / certificate / proposal) arrived and was authenticated."

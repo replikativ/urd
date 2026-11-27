@@ -90,6 +90,7 @@
       (is (= 1 (count @landed)) "the write was issued, it is only unfinished")
       (is (= {:hard-state {:term 1}} (:writes (first @landed))))
 
+      (clojure.core.async/>!! gate true)
       (close! gate)
       (settle!)
       (is (= [:persisted :gated] (input-types runtime))
@@ -596,3 +597,65 @@
       (is (true? @(:running? runtime))
           "a lost buffered write is not a reason to stop the node")
       (<!! (rt/stop-runtime! runtime)))))
+
+(deftest checkpoints-and-appends-survive-reopen-in-issue-order
+  (let [ks (<!! (new-mem-store))
+        s (kstore/konserve-store ks)
+        record (fn [v] {:writes {:value v} :durable? true})
+        pending [(store/write! s (record 0))
+                 (store/checkpoint! s [(record 1)])
+                 (store/write! s (record 2))
+                 (store/checkpoint! s [(record 3)])
+                 (store/write! s (record 4))]
+        closed (store/close-store! s)]
+    (is (every? true? (mapv <!! pending)))
+    (is (true? (<!! closed)))
+    (let [reopened (kstore/konserve-store ks)]
+      (try
+        (is (= (mapv record [3 4]) (:writes (<!! (store/restore reopened)))))
+        (finally (<!! (store/close-store! reopened)))))))
+
+(deftest callback-errors-are-reported-without-a-second-invocation
+  (let [calls (atom [])
+        error (promise)
+        runtime (start! {:node (echo-node #{:commit})
+                         :on-error #(deliver error %)
+                         :on-finalize (fn [& args]
+                                        (swap! calls conj args)
+                                        (throw (clojure.lang.ArityException. 0 "nested")))})]
+    (try
+      (rt/send-event! runtime {:type :apply :fx [(n/commit [:v])]})
+      (is (instance? clojure.lang.ArityException (deref error 3000 nil)))
+      (is (= [[[:v]]] @calls))
+      (finally (<!! (rt/stop-runtime! runtime))))))
+
+(deftest legacy-finalizer-receives-consecutive-heights-for-separate-effects
+  (let [delivered (atom [])
+        ready (promise)
+        runtime (start! {:node (echo-node #{:commit})
+                         :delivered-through 10
+                         :on-finalize (fn [vertex height & _]
+                                        (when (= 2 (count (swap! delivered conj [vertex height])))
+                                          (deliver ready true)))})]
+    (try
+      (rt/send-event! runtime {:type :apply :fx [(n/commit [:a]) (n/commit [:b])]})
+      (is (= true (deref ready 3000 nil)))
+      (is (= [[:a 10] [:b 11]] @delivered))
+      (finally (<!! (rt/stop-runtime! runtime))))))
+
+(deftest durable-completions-preserve-issue-order
+  (let [gates (mapv (fn [_] (chan 1)) (range 2))
+        store (reify store/DurableStore
+                (restore [_] (go {:writes [] :durable {}}))
+                (write! [_ record] (gates (get-in record [:writes :n]))))
+        runtime (start! {:node (echo-node #{:persist-then}) :store store})
+        writes (mapv #(n/persist-then {:writes {:n %} :durable? true :token %}) [0 1])]
+    (try
+      (rt/send-event! runtime {:type :flush :fx writes})
+      (clojure.core.async/>!! (gates 1) true)
+      (settle!)
+      (is (empty? (filter #(= :persisted (:type %)) (:inputs (rt/get-state runtime)))))
+      (clojure.core.async/>!! (gates 0) true)
+      (settle!)
+      (is (= [0 1] (keep :token (:inputs (rt/get-state runtime)))))
+      (finally (<!! (rt/stop-runtime! runtime))))))

@@ -145,6 +145,9 @@
   [runtime to msg]
   (do-broadcast runtime direct-topic msg to))
 
+(defn- unix-seconds []
+  (quot #?(:clj (System/currentTimeMillis) :cljs (.now js/Date)) 1000))
+
 (defn- do-set-timer
   "Arm `timer-id`, replacing any live arming of the same id.
 
@@ -207,33 +210,41 @@
                      ;; which the trace showed at once: every node had seen only
                      ;; `:init`.
                      (when @(:running? runtime)
-                       (emit-event! runtime (n/timer-fired timer-id)))
+                       (emit-event! runtime (cond-> (n/timer-fired timer-id)
+                                              (= :clock timer-id) (assoc :unix-time (unix-seconds)))))
                      (forget!))
          cancel-ch ([_] (forget!)))))))
 
 (defn- do-cancel-timer [runtime timer-id]
   (when-let [cancel-fn (get @(:timers runtime) timer-id)] (cancel-fn)))
 
-(defn- call-flex
-  "Call `f` with `args`, falling back to fewer if it takes fewer.
-
-  The legacy callbacks were `(fn [])` for propose and `(fn [proposal height])`
-  for finalize. The height argument was `:commit`'s `:index`, which is gone --
-  it was read by no interpreter and its only test asserted it was not monotone.
-  Rather than break every caller at once, both shapes are accepted: a
-  one-argument `on-propose` gets the request context, a two-argument
-  `on-finalize` gets (vertex, height) per vertex.
-
-  Deliberately narrow. This exists so the port lands in one piece, not as a
-  permanent interface; the shape to write against is the arity below."
-  [f args fallback]
-  (try (apply f args)
-       (catch #?(:clj clojure.lang.ArityException :cljs js/Error) _ (apply f fallback))))
+(defn- legacy-callback?
+  "Recognize ordinary fixed-arity legacy callbacks once, before invocation."
+  [f arity]
+  (and f
+       #?(:clj
+          (let [f (if (var? f) @f f)
+                fixed (into #{} (comp (filter #(= "invoke" (.getName ^java.lang.reflect.Method %)))
+                                      (map #(.getParameterCount ^java.lang.reflect.Method %)))
+                            (.getDeclaredMethods (class f)))
+                accepts? (fn [n] (or (contains? fixed n)
+                                     (and (instance? clojure.lang.RestFn f)
+                                          (<= (.getRequiredArity ^clojure.lang.RestFn f) n))))]
+            (and (accepts? arity) (not (accepts? 1))))
+          :cljs
+          (let [accepts? (fn [n]
+                           (or (some? (aget f (str "cljs$core$IFn$_invoke$arity$" n)))
+                               (if (.-cljs$lang$applyTo f)
+                                 (<= (.-cljs$lang$maxFixedArity f) n)
+                                 (= n (.-length f)))))]
+            (and (fn? f) (accepts? arity) (not (accepts? 1)))))))
 
 (defn- do-request-value [runtime context]
-  (go-try-
-   (when-let [f (:on-propose runtime)]
-     (emit-event! runtime (n/value-ready (call-flex f [context] []))))))
+  (when-let [f (:on-propose runtime)]
+    (go (try
+          (emit-event! runtime (n/value-ready (f context) context))
+          (catch #?(:clj Throwable :cljs :default) e
+            (handle-loop-error! runtime e))))))
 
 (defn- warn! [runtime & parts]
   (println "[" (:peer-id runtime) "] warn -" (apply str (interpose " " parts))))
@@ -249,6 +260,25 @@
   ordering the barrier exists to impose. Routing the completion through the
   event channel puts both steps back on the loop, in the simulator's order."
   ::persist-complete)
+
+(defn- await-durable-writes! [runtime]
+  ;; Storage acknowledgements can wake different dispatch threads. Deliver the
+  ;; corresponding state transitions and application callbacks in issue order.
+  (go
+    (loop []
+      (when-let [[landed completion] (<! (:durable-queue runtime))]
+        (alt!
+          (:control-ch runtime) ([_] nil)
+          landed ([result]
+                  (when @(:running? runtime)
+                    (if (true? result)
+                      (do (emit-event! runtime completion) (recur))
+                      (handle-loop-error!
+                       runtime
+                       (ex-info "durable write failed -- the barrier cannot be honoured"
+                                {:peer-id (:peer-id runtime) :token (:token completion)}
+                                (when (instance? #?(:clj Throwable :cljs js/Error) result)
+                                  result)))))))))))
 
 (defn- do-persist-then [runtime params]
   (let [{:keys [writes durable? epoch then truncate-from checkpoint]} params
@@ -268,34 +298,7 @@
         completion {:type persist-complete :token token :epoch epoch
                     :then (or then [])}]
     (if durable?
-      ;; The barrier. Nothing gated goes out until the store says the record
-      ;; survives a crash.
-      ;;
-      ;; A FAILURE here is fatal, and used to be silent. `<?-` throws, `go-try-`
-      ;; puts the exception on the channel it returns, and `interpret-effects`
-      ;; discards that channel -- so the node never received `persisted`, its
-      ;; `:then` never fired, and `last-error` stayed nil while `running?`
-      ;; stayed true. Tendermint, Bullshark and SCP all put `commit` in that
-      ;; `:then`. Measured: a store that fails every write produced a node that
-      ;; committed nothing, reported no error, and looked perfectly healthy.
-      ;;
-      ;; Fail-stop rather than retry. The algorithm is waiting on a promise the
-      ;; store could not keep, and carrying on without the write is precisely
-      ;; the safety violation the barrier exists to prevent. A deployment that
-      ;; wants retries supplies a retrying `DurableStore` -- that is the layer
-      ;; where "how many times, and for how long" can be answered.
-      ;;
-      ;; Note the asymmetry this removes: the BUFFERED branch below already
-      ;; read its result and warned, because "a failure that no one looks at is
-      ;; a write the node believes it made". The durable branch is the one that
-      ;; matters more and was the one not looking.
-      (go (let [r (<! landed)]
-            (if (instance? #?(:clj Throwable :cljs js/Error) r)
-              (handle-loop-error!
-               runtime
-               (ex-info "durable write failed -- the barrier cannot be honoured"
-                        {:peer-id (:peer-id runtime) :token token} r))
-              (emit-event! runtime completion))))
+      (put! (:durable-queue runtime) [landed completion])
       ;; Buffered: the node is told immediately and the write proceeds behind
       ;; it. The result is still read -- a failure that no one looks at is a
       ;; write the node believes it made.
@@ -384,20 +387,17 @@
   [runtime vertices]
   ;; The committed tail is tracked so `:revert` can be CHECKED rather than
   ;; trusted; see `do-revert`.
-  (swap! (:committed runtime)
-         (fn [{:keys [tail trimmed]}]
-           (let [t (into tail vertices)
-                 over (max 0 (- (count t) (:tail-limit runtime)))]
-             {:tail (subvec t over) :trimmed (+ trimmed over)})))
-  (when-let [f (:on-finalize runtime)]
-    (try (f vertices)
-         (catch #?(:clj clojure.lang.ArityException :cljs js/Error) _
-           ;; Legacy two-arity shape. The height is the node's own, read after
-           ;; the transition and stepped back over the committed vertices.
-           (let [h (:height @(:node-state runtime))
-                 base (- (or h (count vertices)) (count vertices))]
-             (doseq [[i v] (map-indexed vector vertices)]
-               (f v (+ base i))))))))
+  (let [[previous _] (swap-vals! (:committed runtime)
+                                 (fn [{:keys [tail trimmed]}]
+                                   (let [t (into tail vertices)
+                                         over (max 0 (- (count t) (:tail-limit runtime)))]
+                                     {:tail (subvec t over) :trimmed (+ trimmed over)})))]
+    (when-let [f (:on-finalize runtime)]
+      (if (:legacy-finalize? runtime)
+        (let [base (+ (:trimmed previous) (count (:tail previous)))]
+          (doseq [[i v] (map-indexed vector vertices)]
+            (f v (+ base i))))
+        (f vertices)))))
 
 (defn- do-revert
   "Roll the committed prefix back, having first checked that we agree about
@@ -748,6 +748,7 @@
                      (if (fn? d) (d) d))
          {:keys [state effects]} (n/init node (assoc config
                                                      :restored restored
+                                                     :unix-time (unix-seconds)
                                                      :delivered-through delivered))
          runtime (map->ConsensusRuntime
                   {:peer-id peer-id
@@ -774,7 +775,8 @@
                    :tail-limit (or tail-limit default-tail-limit)
                    :write-seq (atom 0)
                    :tick-ms (or tick-ms default-tick-ms)
-                   :on-propose on-propose
+                   :on-propose (if (legacy-callback? on-propose 0) (fn [_] (on-propose)) on-propose)
+                   :legacy-finalize? (legacy-callback? on-finalize 2)
                    :on-finalize on-finalize
                    :on-revert on-revert
                    :on-resync on-resync
@@ -784,8 +786,10 @@
                    :dropped (atom 0)
                    :running? (atom true)
                    :event-ch (chan 100)
-                   :control-ch (chan)})]
+                   :control-ch (chan)
+                   :durable-queue (chan 64)})]
      (<?- (setup-network-handlers runtime))
+     (await-durable-writes! runtime)
      (run-event-loop runtime)
      ;; `init` may arm a timer or ask for a value, so its effects are
      ;; interpreted like any others -- and only after the loop is running, so
@@ -797,7 +801,8 @@
   (go-try-
    (reset! (:running? runtime) false)
    (doseq [[_ cancel-fn] @(:timers runtime)] (cancel-fn))
-   (put! (:control-ch runtime) :stop)
+   (close! (:control-ch runtime))
+   (close! (:durable-queue runtime))
    (close! (:event-ch runtime))
    nil))
 

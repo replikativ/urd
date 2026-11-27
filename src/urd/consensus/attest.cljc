@@ -75,6 +75,7 @@
   an upstream change to geheimnis and is recorded in the backlog."
   (:require [clojure.core.async :as a :refer [go <!]]
             [org.replikativ.geheimnis.sign :as sign]
+            [urd.consensus.node :as node]
             [urd.wire :as wire]))
 
 ;; ============================================================
@@ -218,7 +219,7 @@
   to compute this inline, because the previous home for it -- `urd.crypto` --
   was an uncalled certificate layer that was deleted."
   [n]
-  (inc (quot (* 2 n) 3)))
+  (node/byzantine-threshold n))
 
 (defn certificate
   "A portable, third-party-checkable proof that `payload` was decided.
