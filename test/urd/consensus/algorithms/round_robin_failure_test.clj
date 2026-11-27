@@ -428,6 +428,7 @@
                     (assoc :votes {(:snapshot-id test-proposal) #{validator-b validator-c}}))
 
           r1 (handle-event sm state {:type :proposal-finalized
+                                     :sender validator-b
                                      :proposal test-proposal
                                      :height 0})]
 
@@ -450,6 +451,7 @@
 
           ;; Finalize event for old height
           r1 (handle-event sm state {:type :proposal-finalized
+                                     :sender validator-b
                                      :proposal test-proposal
                                      :height 0})]
 
