@@ -115,13 +115,26 @@
     (when (and (:closed? jobs) (zero? (:active jobs)))
       (close! (:network-drained runtime)))))
 
-(defn- network-job! [runtime work]
-  ;; Register synchronously before scheduling any IO. Closing admission and
-  ;; claiming a job are atomic with respect to each other.
-  (let [[previous _] (swap-vals! (:network-jobs runtime)
-                                 #(cond-> % (not (:closed? %)) (update :active inc)))]
-    (when-not (:closed? previous)
-      (let [finish (fn [_] (update-network-jobs! runtime #(update % :active dec)))]
+(def ^:private max-envelope-jobs 128)
+
+(defn- network-job! [runtime kind work]
+  ;; Admission and close share one atom. Each direction gets its own capacity,
+  ;; so slow receipt writes leave room to send. Archive reads carry an awaited
+  ;; local completion and must run even when the transport is saturated.
+  (let [available? (fn [jobs] (or (= kind :archive)
+                                  (< (get jobs kind 0) max-envelope-jobs)))
+        [previous current] (swap-vals! (:network-jobs runtime)
+                                       (fn [jobs]
+                                         (if (or (:closed? jobs) (not (available? jobs)))
+                                           jobs
+                                           (-> jobs (update :active inc)
+                                               (update kind (fnil inc 0))))))]
+    (cond
+      (:closed? previous) nil
+      (= (:active previous) (:active current)) (swap! (:dropped runtime) inc)
+      :else
+      (let [finish (fn [_] (update-network-jobs! runtime #(-> % (update :active dec)
+                                                              (update kind dec))))]
         (try
           (if @(:running? runtime)
             (take! (work) finish)
@@ -140,7 +153,7 @@
   ([runtime topic msg] (do-broadcast runtime topic msg nil))
   ([runtime topic msg to]
    (network-job!
-    runtime
+    runtime :send
     (fn []
       (go-try-
        (when-let [envelope (try
@@ -274,7 +287,7 @@
 
 (defn- do-read-durable [runtime {ks :keys token :token}]
   (network-job!
-   runtime
+   runtime :archive
    (fn []
      (go
        (let [values (try
@@ -704,7 +717,7 @@
                                   (= (:peer-id runtime) (:to envelope))
                                   (nil? (:to envelope))))
                        (network-job!
-                        runtime
+                        runtime :receive
                         (fn []
                           (go-try-
                            (when-let [{:keys [from msg verified-by]}
@@ -910,13 +923,8 @@
   @(:error runtime))
 
 (defn dropped-messages
-  "How many messages this node could not process, and discarded.
-
-  Exposed rather than merely logged, because the alternative to halting on a
-  malformed message is dropping it, and a drop that nobody can count is
-  indistinguishable from a network that is quiet. A cluster under a
-  malformed-message flood should be visible as a number going up, not inferred
-  from silence."
+  "Number of malformed messages discarded and incoming or outgoing envelopes
+  dropped because the runtime reached its network concurrency limit."
   [runtime]
   @(:dropped runtime))
 

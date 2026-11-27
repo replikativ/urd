@@ -759,3 +759,19 @@
       (is (= done (second (clojure.core.async/alts!! [done (timeout 3000)])))))
     (is (identical? error (rt/last-error runtime)))
     (is (empty? (input-types runtime)))))
+
+(deftest envelope-admission-preserves-outbound-and-archive-capacity
+  (let [runtime {:running? (atom true) :network-jobs (atom {:active 0})
+                 :network-drained (chan) :dropped (atom 0)}
+        gate (chan)
+        run #(do (#'rt/network-job! runtime % (fn [] gate)) nil)]
+    (with-redefs-fn {#'rt/max-envelope-jobs 2}
+      #(do (dotimes [_ 3] (run :receive))
+           (run :send)
+           (run :archive)
+           (is (= 1 @(:dropped runtime)))
+           (is (= {:active 4 :receive 2 :send 1 :archive 1} @(:network-jobs runtime)))
+           (swap! (:network-jobs runtime) assoc :closed? true)
+           (close! gate)
+           (<!! (:network-drained runtime))
+           (is (zero? (:active @(:network-jobs runtime))))))))

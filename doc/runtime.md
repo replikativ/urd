@@ -165,3 +165,10 @@ of the backend before resolving ownership.
 > costing a server 1,364 MB of heap in 8 seconds, with `send!` returning `true`
 > throughout. urd inherits that, and consensus liveness depends on validators
 > staying up.
+
+
+A runtime admits up to 128 incoming and 128 outgoing envelope operations
+concurrently. When authentication or transport falls behind, excess envelopes
+increment `dropped-messages` and the protocol can retransmit. Consensus WAL
+writes and local archive responses retain their delivery semantics. Monitor
+drops alongside disk latency and configure consensus timeouts for the store.

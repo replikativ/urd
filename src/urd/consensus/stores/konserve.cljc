@@ -159,11 +159,13 @@
 
 (defn- submit! [queue operation]
   (let [reply (chan 1)]
-    (put! queue [operation reply]
-          (fn [accepted?]
-            (when-not accepted?
-              (put! reply (ex-info "Consensus store is closed" {}))
-              (close! reply))))
+    (let [reject! (fn [error] (put! reply error) (close! reply))]
+      (try
+        (put! queue [operation reply]
+              (fn [accepted?]
+                (when-not accepted? (reject! (ex-info "Consensus store is closed" {})))))
+        (catch #?(:clj AssertionError :cljs :default) e
+          (reject! (ex-info "Consensus store could not queue operation" {} e)))))
     reply))
 
 (defrecord KonserveStore [ks log-key logical-key queue writer]
