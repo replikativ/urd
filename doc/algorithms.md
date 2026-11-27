@@ -16,13 +16,31 @@ trie and the Slush/Snowflake/Snowball primitives that Snowman is built from.
 | **round-robin** | crash | majority | head count | yes | yes, next height | reference |
 | **bullshark** | Byzantine | `2f+1` | **stake** | yes | refuses | reference-grade |
 | **scp** | Byzantine, federated | quorum slices | per-node slices | yes | n/a | reference-grade |
-| **snowman** | probabilistic | sampling | n/a | **no** | no | stress test |
+| **snowman** | probabilistic | weighted sampling | stake | accepted chain | no | stress test |
 | **nakamoto** | open membership | cumulative work | n/a | yes | n/a | generality test |
 
 Two thresholds appear throughout and are **not** interchangeable:
 `majority-threshold` is `floor(n/2)+1`, `byzantine-threshold` is
 `floor(2n/3)+1`. They coincide at n=4 and diverge from n=5 on. A generative
 test pins the distinction so that nobody "fixes" one to match the other.
+
+## Running a validator over time
+
+The consensus WAL, the application's database, and the history served to peers
+have different retention requirements. Size each window for the expected write
+rate and maximum offline time. Keep a durable application cursor alongside the
+state it describes. The following costs refer to an ordinary validator on this
+implementation. A WAL record or certificate can contain many votes or parents.
+
+| Algorithm | What grows and what recovery reads | Difference from the reference |
+|---|---|---|
+| Raft | Compaction retains an applied window plus the unapplied suffix. Inside the window a follower receives missing entries. Beyond it, install an authenticated application snapshot and its term, index and membership together. | etcd-raft can send a snapshot through its host. Urd requires an offline install and then verifies the boundary through ordinary replication. |
+| Tendermint | The defaults keep 1,000 decision heights and checkpoint every 100 decided heights. Each retained certificate can contain one signature per validator. A deep restore needs the committee, powers and proposer priorities at the application cursor, plus the recovering node’s own signing state. | CometBFT provides indexed commit history and state-sync machinery. Urd serves retained evidence and expects the host to install a trusted boundary beyond that window. |
+| Round-robin | Restart scans the full decision WAL even when the application needs only one decision. Peer recovery serves a bounded window. | The original Urd prototype kept votes in memory. The current version persists the voting fence and history. An unavailable assigned proposer can still stall a height. |
+| Bullshark | The live DAG is pruned. Startup replays local certificate history. An optional archive lookup scans the full retained WAL once per batch of missing digests. | Narwhal has keyed certificate storage and resumes ordering from persisted progress. Old-peer catch-up in Urd costs more as the archive grows. |
+| Snowman | Each poll samples up to `k` peers. Selecting `k` stake units can take `O(kN)` work for `N` validators. Ordinary recovery rebuilds the accepted history since the stored root and keeps those blocks addressable in memory. | AvalancheGo separates the live processing tree from the VM’s historical block store. Urd can start from a trusted frontier but does not advance it automatically to bound history. |
+| Nakamoto | For `B` retained connected headers, including forks, a checkpoint sorts `B` headers and writes all of them. Forward sync sends up to 128 headers per reply. | btcd maintains an incremental block index. In Urd, checkpoint write volume rises with the size of the index even when all peers are current. |
+| SCP | Local recovery resumes persisted slot state. Quorum evaluation depends on the topology and size of the quorum sets. Bounding the set cache does not supply a ledger history to an offline peer. | Stellar Core combines SCP with history archives and ledger catch-up. A Urd application must supply that recovery path. |
 
 ## Tendermint
 
