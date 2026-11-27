@@ -766,7 +766,10 @@
   never executed."
   [st v]
   (and (some? (value-id v))
-       (boolean ((:valid-fn st) v))))
+       (boolean ((:valid-fn st) v))
+       (if-let [validate (:valid-at-height? st)]
+         (boolean (validate (:height st) v))
+         true)))
 
 (defn- start-round [st r]
   (let [prev (:round st)
@@ -1656,7 +1659,8 @@
     ;; rest of the network already has.
     {:emits #{:broadcast :send :persist-then :set-timer :cancel-timer
               :request-value :commit :report-equivocation :log}
-     :topics #{:consensus}})
+     :topics #{:consensus}
+     :height-aware-validation? true})
 
   (init [_ config]
     (let [cfg (assoc-in (merge default-config config) [:restored :durable]
@@ -1683,6 +1687,7 @@
                 :powers powers
                 :membership (or (:membership cfg) power-weighted-bft)
                 :valid-fn (or (:valid-fn cfg) (constantly true))
+                :valid-at-height? (:valid-at-height? cfg)
                 ;; OPTIONAL, unlike round-robin's, which are required. Absent,
                 ;; precommits carry no attestation, no certificate is ever
                 ;; assembled, and catch-up falls back to f+1 corroboration --

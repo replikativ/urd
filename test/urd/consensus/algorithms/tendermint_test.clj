@@ -1818,3 +1818,12 @@
             reply (->> (:effects (send-msg st :new-peer {:type :status :height 0}))
                        (filter #(= :send (node/effect-kind %))) first node/effect-params)]
         (is (= cert (get-in reply [:msg :cert])))))))
+
+(deftest prevote-checks-the-local-height-alongside-value-validity
+  (let [v {:id :x :claimed-height 25}
+        state (-> (st0 :round 0 :step :propose)
+                  (assoc-in [:proposals 0 :a] (pp :a 0 v -1)))
+        vote (fn [accept?]
+               (mapv :value-id (signed (#'tm/rule-l22 (assoc state :valid-at-height? accept?)))))]
+    (is (= [nil] (vote (fn [height v] (= height (:claimed-height v))))))
+    (is (= [:x] (vote (fn [height _] (zero? height)))))))

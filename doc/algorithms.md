@@ -59,6 +59,14 @@ inside `addVote` rather than as a prevote rule.
 Set changes activate at **height + 1**. That offset is pinned by a test that
 verifies it *by mutation* — shifting it passes every other test in the suite.
 
+Applications that derive voting-power changes from a ledger can supply
+`:valid-at-height? (fn [height proposal] ...)` alongside `:valid-fn`.
+Tendermint supplies its current decision height on live proposals and on
+catch-up decisions. Check the proposed changes against the local application
+boundary for that height. A validator whose application has not reached the
+boundary must wait for it before endorsing the value. Keep both predicates
+deterministic and side-effect free.
+
 For state transfer, install the authenticated consensus boundary for the last applied
 height alongside the application snapshot. Its fields are `:decided-through`,
 `:post-activation?`, `:validators`, `:powers`, and `:priorities` as written by
