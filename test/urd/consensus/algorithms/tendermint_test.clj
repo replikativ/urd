@@ -1103,7 +1103,7 @@
           all (concat before-signed after-signed)]
       (is (some? cp-state)
           "the run must actually reach a checkpoint, or this proves nothing")
-      (is (= [:decided-through :decisions :last-commit :last-signed :powers
+      (is (= [:decided-through :decisions :last-commit :last-signed :post-activation? :powers
               :priorities :validators]
              (sort (keys (:writes cp))))
           "and the checkpoint is the WHOLE durable state -- the store keeps
@@ -1248,12 +1248,13 @@
              and handing them over again writes every transaction twice")))
 
     (testing "and whichever source is further along wins"
-      (is (= 91 (:height (:state (node/init (tm/make)
-                                            {:peer-id :n :validators [:a :b :c]
-                                             :delivered-through 10
-                                             :restored {:durable {:decided-through 90}
-                                                        :writes []}}))))
-          "our own durable register, when the consumer lags it")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"application replay is unavailable"
+                            (node/init (tm/make)
+                                       {:peer-id :n :validators [:a :b :c]
+                                        :delivered-through 10
+                                        :restored {:durable {:decided-through 90}
+                                                   :writes []}}))
+          "a consumer behind the available decisions needs state transfer")
       (is (= 300 (:height (:state (node/init (tm/make)
                                              {:peer-id :n :validators [:a :b :c]
                                               :delivered-through 300
@@ -1747,3 +1748,109 @@
           st (:state (node/init impl {:peer-id :a :validators [:a :b :c :d]}))]
       (is (= #{} (:done-l22 st)))
       (is (= #{} (:done-l28 st))))))
+
+(deftest catchup-enforces-the-live-value-contract
+  (let [impl (tm/make)
+        valid-value {:data :a :id (tm/content-id {:data :a})}
+        st (:state (node/init impl (merge atts {:peer-id :a :validators peers
+                                                :valid-fn tm/valid-content-id?})))
+        decide-on (fn [st from decision cert]
+                    (:state (node/step impl st (node/message-received
+                                                from {:type :catchup :from from :height 0
+                                                      :decision decision :cert cert}
+                                                #{from}))))
+        certified (fn [vid]
+                    {:height 0 :round 1 :value-id vid
+                     :votes (into {} (map (fn [p] [p ((:sign-vote atts) p
+                                                                        (tm/vote-payload 0 1 vid))])
+                                          peers))})]
+    (is (false? (tm/valid-certificate? st (certified nil) 0 nil)))
+    (is (empty? (:decisions (decide-on st :b nil (certified nil)))))
+    (is (empty? (:decisions (decide-on st :b (assoc valid-value :data :b)
+                                       (certified (:id valid-value))))))
+    (is (= valid-value (get-in (decide-on st :b valid-value (certified (:id valid-value)))
+                               [:decisions 0])))
+    (let [st (assoc st :valid-fn (constantly true))
+          one (decide-on st :b valid-value nil)
+          two (decide-on one :c (assoc valid-value :data :b) nil)]
+      (is (empty? (:decisions two)))
+      (is (= valid-value (get-in (decide-on two :d valid-value nil) [:decisions 0]))))))
+
+(deftest checkpoint-replay-restores-the-next-heights-lock
+  (let [impl (tm/make)
+        checkpoint {:decided-through 8 :decisions {8 :finished}}
+        vote {:type :precommit :height 9 :round 2 :from :b :value-id :locked}
+        suffix {:wal vote :last-signed {:height 9 :round 2 :step :precommit}}
+        writes (mapv (fn [w] {:writes w :durable? true}) [checkpoint suffix])
+        cfg {:peer-id :b :validators peers
+             :restored {:durable (merge checkpoint suffix) :writes writes}}
+        st (:state (node/init impl cfg))]
+    (is (= [9 2 :precommit] ((juxt :height :round :step) st)))
+    (is (= [:locked 2] (tm/locked st)))
+    (is (= vote (get-in st [:precommits 2 :b])))))
+
+(deftest a-reconfiguration-checkpoint-restores-the-live-proposer-state
+  (let [impl (tm/make)
+        cfg {:peer-id :b :validators peers :wal-retention 1}
+        value {:id :v :validator-updates [{:id :a :power 0} {:id :new :power 2}]}
+        st (-> (:state (node/init impl cfg))
+               (assoc :height 1 :fx {:msgs [] :logs [] :signed []})
+               (#'tm/decide 0 value))
+        live (#'tm/advance-height st)
+        effect (->> (:effects (#'tm/finish st))
+                    (filter #(= :persist-then (node/effect-kind %))) first node/effect-params)
+        cp (:checkpoint effect)
+        ordinary (:writes effect)
+        legacy-cp (merge (select-keys st [:validators :powers :priorities :decisions])
+                         {:decided-through 1})
+        legacy-ordinary (-> ordinary (dissoc :post-activation?)
+                            (assoc :priorities (:priorities st)))
+        expected (select-keys live [:validators :powers :priorities])]
+    (is (seq cp))
+    (doseq [records [cp [{:writes ordinary}] [{:writes legacy-cp}] [{:writes legacy-ordinary}]]]
+      (let [durable (apply merge (map :writes records))
+            restored (:state (node/init impl (assoc cfg :restored
+                                                    {:durable durable :writes records})))]
+        (is (= expected (select-keys restored (keys expected))))))))
+
+(deftest application-replays-its-undelivered-decisions-in-order
+  (let [records (mapv (fn [h] {:writes {:wal {:type :end-height :height h :decision [:v h]}
+                                        :decided-through h}})
+                      (range 4))
+        cfg {:peer-id :b :validators peers
+             :restored {:durable (:writes (peek records)) :writes records}}
+        commits (fn [delivered]
+                  (->> (:effects (node/init (tm/make) (assoc cfg :delivered-through delivered)))
+                       (filter #(= :commit (node/effect-kind %)))
+                       (mapcat #(get (node/effect-params %) :vertices))))]
+    (is (= [[:v 2] [:v 3]] (commits 2)))
+    (is (empty? (commits 4)))))
+
+(deftest only-the-awaited-proposal-response-can-be-signed
+  (let [impl (tm/make)
+        cfg {:peer-id :a :validators peers}
+        {st :state} (node/init impl cfg)
+        response (fn [ctx] (node/step impl st (node/value-ready :v ctx)))]
+    (is (= {:height 0 :round 0} (:awaiting-value st)))
+    (is (nil? (get-in (response {:height 0 :round 1}) [:state :last-signed])))
+    (is (= :propose (get-in (response (:awaiting-value st)) [:state :last-signed :step])))))
+
+(deftest content-id-covers-the-complete-proposal
+  (let [payload {:validator-updates [{:id :a :power 2}] :batch [1 2]}
+        proposal (assoc payload :id (tm/content-id payload))]
+    (is (= "c19a797fa1fd590cd2e5b42d1cf5f246e29b91684e2f87404b81dc345c7a56a0" (tm/content-id {}))
+        "SHA-256 of the canonical CBOR empty map (0xa0)")
+    (is (= (:id proposal) (tm/content-id (into (array-map) (reverse (seq proposal))))))
+    (is (tm/valid-content-id? proposal))
+    (is (false? (tm/valid-content-id? (assoc-in proposal [:validator-updates 0 :power] 3))))
+    (is (false? (tm/valid-content-id? (assoc proposal :batch [2 1]))))
+    (is (false? (tm/valid-content-id? (dissoc proposal :id))))
+    (is (false? (tm/valid-content-id? :legacy))))
+  (let [propose (fn [_ _ ctx]
+                  (let [payload {:transactions [(:height ctx)]}]
+                    (assoc payload :id (tm/content-id payload))))
+        s (sim/run (fresh {:value-fn propose} {:valid-fn tm/valid-content-id?}) 90)
+        history (sim/committed s :a)]
+    (is (seq history))
+    (is (every? tm/valid-content-id? history))
+    (is (sim/agreement? s))))
