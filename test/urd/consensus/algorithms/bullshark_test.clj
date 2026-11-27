@@ -705,7 +705,8 @@
     (is (some #(pos? (get (sim/node-state healed %) :archive-seq 0)) [:a :b :c]))))
 
 (deftest archived-reads-are-opt-in-bounded-and-fair-across-validators
-  (let [certs (mapv #(get (bs/genesis-certificates vs) %) vs)
+  (let [parents (into #{} (map :id) (vals (bs/genesis-certificates vs)))
+        certs (mapv #(cert* {:author % :round 1 :parents parents} (set vs)) vs)
         ids (mapv :id certs)
         base (assoc (node-init {:gc-depth 1 :store-depth 2})
                     :last-committed-round 8 :certificates {})
@@ -720,15 +721,17 @@
         next-state (-> (:state active) (want :b 1) tick :state)
         token (get-in next-state [:archive-active :token])
         complete (n/step (bs/create) next-state
-                         (n/durable-values token {[:cert (first ids)]
-                                                  {:id (first ids) :header {:round 1}}}))]
+                         (n/durable-values token {[:cert (first ids)] (first certs)}))]
     (is (empty? (:archive-queue (want base :b 1))))
     (is (empty? (:archive-queue (want enabled :b 7))))
     (is (= [:b :c] (:archive-queue queued)))
     (is (= [(n/read-durable token (map #(vector :cert %) ids))]
            (filter #(= :read-durable (first %)) (:effects active))))
     (is (= 1 (:archive-seq next-state)))
+    (is (= next-state (:state (n/step (bs/create) next-state
+                                      (n/durable-values (inc token) {})))))
     (is (= :b (get-in complete [:effects 0 1 :to])))
+    (is (= (first certs) (get-in complete [:effects 0 1 :msg :cert])))
     (is (= :c (get-in (tick (:state complete)) [:state :archive-active :peer])))
     (is (empty? (:certificates (:state complete))))))
 
