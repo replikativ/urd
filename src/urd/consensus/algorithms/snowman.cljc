@@ -99,7 +99,6 @@
      which is a pleasing inversion of the usual intuition."
   (:require [clojure.string :as str]
             [urd.consensus.node :as n]
-            [urd.consensus.pending :as pending]
             [urd.consensus.algorithms.snowflake :as sf]
             [urd.consensus.algorithms.snowtree :as st]
             [hasch.core :as hasch]))
@@ -218,9 +217,10 @@
     ;; accepted, arriving late. Accepting is absorbing, so it can never win --
     ;; admitting it would only leak a Snowball instance under a parent nothing
     ;; will ever poll again.
-    (and (contains? (:accepted state) parent)
-         (not= parent (:last-accepted state)))
-    (update state :rejected conj id)
+    (or (contains? (:rejected state) parent)
+        (and (contains? (:accepted state) parent)
+             (not= parent (:last-accepted state))))
+    (-> state (update :orphans dissoc id) (update :rejected conj id))
 
     (nil? (get-in state [:blocks parent]))
     ;; Unknown parent. Hold it rather than drop it: blocks reach us over a
@@ -270,8 +270,10 @@
       (= cur stop) {:path (vec acc)}
       (nil? cur) nil
       (> (count acc) max-depth) nil
-      (nil? (get-in state [:blocks cur])) {:missing cur}
-      :else (recur (get-in state [:blocks cur :parent]) (conj acc cur)))))
+      (contains? (:rejected state) cur) nil
+      :else (if-let [block (or (get-in state [:blocks cur]) (get-in state [:orphans cur]))]
+              (recur (:parent block) (conj acc cur))
+              {:missing cur}))))
 
 (defn- path-below
   "The ids from `stop` (exclusive) down to `id` (inclusive), root-first, or nil."
@@ -302,8 +304,12 @@
   "Emit a sample request; the reply drives the query round."
   [state]
   (let [rid (:next-request state)]
-    (n/result (assoc state :next-request (inc rid))
-              [(n/sample rid (get-in state [:params :k]) :peers)])))
+    (n/result (-> state
+                  (assoc :next-request (inc rid))
+                  (update :polls-run inc)
+                  (assoc-in [:outstanding rid] {:issued (inc (:polls-run state))}))
+              [(n/set-timer [:poll-expire rid] (:poll-timeout state))
+               (n/sample rid (get-in state [:params :k]) :peers)])))
 
 (defn- bubble
   "Turn chits into per-parent vote counts: {parent {child votes}}.
@@ -322,24 +328,6 @@
                         acc path))
               acc))
           {}
-          chits))
-
-(defn- split-chits
-  "Partition chits into those we can tally and those blocked on a block we do
-  not hold. Returns `{:usable {peer pref} :blocked [{:peer :pref :missing}]}`.
-
-  A chit on a genuinely unreachable branch -- rejected, or not descended from
-  our last accepted block -- is in NEITHER: it is correctly discarded, exactly
-  as `topological.go:378` discards a vote that bubbles to nothing."
-  [state chits]
-  (reduce (fn [acc [peer pref]]
-            (let [r (resolve-path state pref (:last-accepted state))]
-              (cond
-                (:path r) (assoc-in acc [:usable peer] pref)
-                (:missing r) (update acc :blocked conj
-                                     {:peer peer :pref pref :missing (:missing r)})
-                :else acc)))
-          {:usable {} :blocked []}
           chits))
 
 (defn- record-votes
@@ -405,41 +393,60 @@
         [state commits] (accept-finalized state)]
     [(assoc state :preference (preferred-tip state)) commits]))
 
-(defn- finish-poll
-  "Record a completed poll's chits and settle the consequences.
+(defn- bound-dependencies
+  "Drop the oldest unresolved replies over the configured age or size bounds."
+  [state effects]
+  (let [cutoff (- (:polls-run state) (:deferred-ttl state))
+        waiting (for [[rid poll] (:outstanding state)
+                      peer (sort (keys (:waiting poll)))]
+                  [rid peer])
+        expired (take-while (fn [[rid _]] (< (get-in state [:outstanding rid :issued]) cutoff))
+                            waiting)
+        drop-n (max (count expired) (- (count waiting) (:deferred-limit state)))]
+    [(reduce (fn [st [rid peer]] (update-in st [:outstanding rid :waiting] dissoc peer))
+             state (take drop-n waiting))
+     (cond-> (vec effects)
+       (pos? drop-n) (conj (n/log-effect :debug {:event :dropped-poll-dependencies
+                                                 :count drop-n})))]))
 
-  A chit naming a block we do not hold is DEFERRED and the block requested from
-  the peer that named it -- the one peer we know has it. It used to be dropped
-  along with any hope of ever obtaining the block, which stranded the node at
-  that height permanently while it went on being sampled, contributing nothing
-  to anyone's tally. avalanchego issues `SendGet` to that peer
-  (`engine.go:709-722`) and schedules the vote as blocked on the block
-  (`:396-415`), applying it when the block lands."
-  [state rid chits weights]
-  (let [{:keys [usable blocked]} (split-chits state chits)
-        [state commits] (tally state usable weights)
-        ;; Park each blocked vote against the block it waits on. Keyed by
-        ;; (request, peer) so a re-delivered chit cannot re-stamp it.
-        state (reduce (fn [st {:keys [peer pref missing]}]
-                        (update st :deferred pending/park
-                                [rid peer] missing
-                                {:peer peer :pref pref :weight (get weights peer 1)}
-                                (:polls-run st 0)))
-                      state
-                      blocked)
-        [deferred dropped] (pending/reap (:deferred state) (:polls-run state 0)
-                                         (:deferred-ttl state)
-                                         (:deferred-limit state))
-        state (assoc state :deferred deferred)
-        asks (mapv (fn [{:keys [peer missing]}]
-                     (n/send-to peer {:kind :get-block :id missing}))
-                   ;; One ask per (peer, block), not one per chit.
-                   (distinct (map #(select-keys % [:peer :missing]) blocked)))]
-    (n/result (update state :polls-run (fnil inc 0))
-              (cond-> (vec (concat commits asks))
-                (pos? dropped)
-                (conj (n/log-effect :debug
-                                    (str "dropped " dropped " deferred votes")))))))
+(defn- drain-polls
+  "Deliver the longest finished prefix in issuance order (poll/set.go)."
+  [state effects]
+  (let [[state effects] (bound-dependencies state effects)]
+    (loop [st state, fx effects]
+      (let [[rid poll] (first (:outstanding st))]
+        (if (and (:closed? poll) (empty? (:waiting poll)))
+          (let [[st commits] (tally st (:votes poll) (:weights poll))]
+            (recur (-> st (update :outstanding dissoc rid) (assoc :last-polled rid))
+                   (into (conj fx (n/cancel-timer [:poll-expire rid])) commits)))
+          (n/result st fx))))))
+
+(defn- resolve-chit
+  "Record a peer's vote once its entire branch connects, or request its missing ancestor."
+  [state rid peer]
+  (let [pref (get-in state [:outstanding rid :chits peer])
+        {:keys [path missing]} (resolve-path state pref (:last-accepted state))
+        state (update-in state [:outstanding rid :waiting] dissoc peer)]
+    (cond
+      path [(assoc-in state [:outstanding rid :votes peer] pref) []]
+      missing [(assoc-in state [:outstanding rid :waiting peer] missing)
+               [(n/send-to peer {:kind :get-block :id missing})]]
+      :else [state []])))
+
+(defn- receive-block
+  [state block]
+  (if (or (nil? (:id block)) (get-in state [:blocks (:id block)]))
+    (n/result state)
+    (let [st (add-block state block)
+          waiting (for [[rid poll] (:outstanding st)
+                        [peer dep] (:waiting poll)
+                        :when (= dep (:id block))]
+                    [rid peer])
+          [st fx] (reduce (fn [[st fx] [rid peer]]
+                            (let [[st asks] (resolve-chit st rid peer)]
+                              [st (into fx asks)]))
+                          [st []] waiting)]
+      (drain-polls (assoc st :preference (preferred-tip st)) (distinct fx)))))
 
 ;; ============================================================
 ;; The node
@@ -520,12 +527,12 @@
                  :preference genesis
                  :commit-index 0
                  :next-request 0
-                 :outstanding {}
+                 :outstanding (sorted-map)
+                 :last-polled -1
                  ;; Votes waiting on a block we have asked for. Bounded both
                  ;; ways: an unbounded pool is a leak an adversary can drive by
                  ;; chitting block ids that do not exist. Aged in POLLS rather
                  ;; than ticks, because polls are what this algorithm counts.
-                 :deferred pending/empty-pool
                  :polls-run 0
                  :deferred-ttl (or (:deferred-ttl config) 20)
                  :deferred-limit (or (:deferred-limit config) 256)}
@@ -540,8 +547,7 @@
       ;; which `preferred-tip` picks up: the new block's parent gets an instance
       ;; preferring it, so if the parent was the tip, the tip moves down.
       :vertex-received
-      (let [state (add-block state (:vertex input))]
-        (n/result (assoc state :preference (preferred-tip state))))
+      (receive-block state (:vertex input))
 
       :timer-fired
       (let [tid (:timer-id input)]
@@ -555,9 +561,9 @@
           ;; `default-poll-timeout`.
           (and (vector? tid) (= :poll-expire (first tid)))
           (let [rid (second tid)]
-            (if-let [out (get-in state [:outstanding rid])]
-              (finish-poll (update state :outstanding dissoc rid)
-                           rid (:chits out) (:weights out))
+            (if (contains? (:outstanding state) rid)
+              (drain-polls (update-in state [:outstanding rid] assoc
+                                      :closed? true :waiting {}) [])
               ;; Already completed on the last chit; the expiry is a straggler.
               (n/result state)))
 
@@ -568,15 +574,21 @@
       ;; several polls are in flight at once and a peer's weight differs between
       ;; them.
       :sampled
-      (let [{:keys [request-id peers]} input
-            state (assoc-in state [:outstanding request-id]
-                            {:expect (set (keys peers)) :weights peers :chits {}})]
-        (n/result state
-                  (conj (mapv (fn [p] (n/send-to p {:kind :query
-                                                    :request-id request-id
+      (let [{rid :request-id peers :peers} input
+            reserved (get-in state [:outstanding rid])]
+        (if (or (<= rid (:last-polled state)) (:weights reserved) (:closed? reserved))
+          (n/result state)
+          (let [st (cond-> (assoc-in state [:outstanding rid]
+                                     {:weights peers :chits {} :votes {} :waiting {}
+                                      :issued (:issued reserved (inc (:polls-run state)))
+                                      :closed? (empty? peers)})
+                     (nil? reserved) (update :polls-run inc))
+                queries (mapv (fn [p] (n/send-to p {:kind :query :request-id rid
                                                     :from (:peer-id state)}))
-                              (sort (keys peers)))
-                        (n/set-timer [:poll-expire request-id] (:poll-timeout state)))))
+                              (sort (keys peers)))]
+            (drain-polls st
+                         (cond-> queries (nil? reserved)
+                                 (conj (n/set-timer [:poll-expire rid] (:poll-timeout state))))))))
 
       :message-received
       (let [{:keys [kind request-id preference]} (:msg input)
@@ -600,39 +612,18 @@
             (n/result state [(n/send-to sender {:kind :block :block blk})])
             (n/result state))
 
-          ;; A block we asked for. Add it, then apply every vote that was
-          ;; waiting on it -- the deferred half of `finish-poll`.
-          :block
-          (let [blk (:block (:msg input))
-                id (:id blk)]
-            (if (or (nil? id) (get-in state [:blocks id]))
-              (n/result state)
-              (let [state (add-block state blk)
-                    [pool waiting] (pending/release (:deferred state) id)
-                    state (assoc state :deferred pool)
-                    chits (into {} (map (juxt :peer :pref)) waiting)
-                    weights (into {} (map (juxt :peer :weight)) waiting)
-                    [state commits] (tally state chits weights)]
-                (n/result (assoc state :preference (preferred-tip state)) commits))))
+          :block (receive-block state (:block (:msg input)))
 
-          ;; A chit came back. Once every sampled peer has answered, tally.
           :chit
-          (let [out (get-in state [:outstanding request-id])]
-            (if-not (and out (contains? (:expect out) sender))
-              ;; Stale poll, unknown poll, or a peer we did not sample.
+          (let [out (when (integer? request-id) (get-in state [:outstanding request-id]))]
+            (if (or (:closed? out) (not (contains? (:weights out) sender))
+                    (contains? (:chits out) sender))
               (n/result state)
-              ;; FIRST response binds. `early_term_traversal.go:144-151` reads
-              ;; the peer's count and then removes it from `polled`, so a
-              ;; second `Vote` from the same peer contributes 0. Overwriting let
-              ;; a sampled Byzantine peer change its vote until the poll closed.
-              (let [chits (if (contains? (:chits out) sender)
-                            (:chits out)
-                            (assoc (:chits out) sender preference))
-                    state (assoc-in state [:outstanding request-id :chits] chits)]
-                (if (< (count chits) (count (:expect out)))
-                  (n/result state)
-                  (finish-poll (update state :outstanding dissoc request-id)
-                               request-id chits (:weights out))))))
+              (let [chits (assoc (:chits out) sender preference)
+                    st (update-in state [:outstanding request-id] assoc :chits chits
+                                  :closed? (= (count chits) (count (:weights out))))
+                    [st asks] (resolve-chit st request-id sender)]
+                (drain-polls st asks))))
           (n/result state)))
 
       (n/result state))))
